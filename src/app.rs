@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use regex::RegexBuilder;
 
-use crate::model::{Comment, Feed, Item, Source, StoryPage, Thread};
+use crate::{
+    layout::{LayoutPreferences, PaneSet, ResolvedMode},
+    model::{Comment, Feed, Item, Source, StoryPage, Thread},
+};
 
 /// The content pane that receives navigation input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +117,8 @@ pub enum AppAction {
         item_id: u64,
         bookmarked: bool,
     },
+    LayoutChanged(LayoutPreferences),
+    LayoutReset,
 }
 
 impl AppAction {
@@ -235,6 +240,10 @@ pub struct App {
     error: Option<String>,
     focus: FocusPane,
     secondary: SecondaryPane,
+    layout: LayoutPreferences,
+    layout_baseline: LayoutPreferences,
+    visible_panes: PaneSet,
+    resolved_mode: ResolvedMode,
     story_selection: Selection,
     comment_selection: Selection,
     detail_scroll: u16,
@@ -283,6 +292,10 @@ impl App {
             error: None,
             focus: FocusPane::Stories,
             secondary: SecondaryPane::Thread,
+            layout: LayoutPreferences::default(),
+            layout_baseline: LayoutPreferences::default(),
+            visible_panes: PaneSet::two(SecondaryPane::Thread),
+            resolved_mode: ResolvedMode::Two,
             story_selection: Selection::empty(),
             comment_selection: Selection::empty(),
             detail_scroll: 0,
@@ -352,6 +365,16 @@ impl App {
     #[must_use]
     pub const fn secondary_pane(&self) -> SecondaryPane {
         self.secondary
+    }
+
+    #[must_use]
+    pub const fn layout_preferences(&self) -> &LayoutPreferences {
+        &self.layout
+    }
+
+    #[must_use]
+    pub const fn visible_panes(&self) -> PaneSet {
+        self.visible_panes
     }
 
     #[must_use]
@@ -689,6 +712,25 @@ impl App {
         }
     }
 
+    /// Installs validated active preferences and the TOML/built-in reset baseline.
+    pub fn configure_layout(&mut self, active: LayoutPreferences, baseline: LayoutPreferences) {
+        debug_assert!(active.clone().validate().is_ok());
+        debug_assert!(baseline.clone().validate().is_ok());
+        self.layout = active;
+        self.layout_baseline = baseline;
+    }
+
+    /// Records which panes the latest frame actually rendered.
+    pub fn set_rendered_panes(&mut self, panes: PaneSet, mode: ResolvedMode) {
+        self.visible_panes = panes;
+        self.resolved_mode = mode;
+        if !panes.contains(self.focus)
+            && let Some(focus) = panes.ordered().next()
+        {
+            self.set_focus(focus);
+        }
+    }
+
     /// Records the number of logical rows visible in each selectable pane. The renderer calls
     /// this after computing the responsive layout; no timer or tick is involved.
     pub fn set_viewports(&mut self, story_rows: usize, comment_rows: usize) {
@@ -730,6 +772,19 @@ impl App {
                 self.help_visible = false;
             }
             return AppAction::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return match key.code {
+                KeyCode::Char('h') => self.resize_focused_pane(-2),
+                KeyCode::Char('l') => self.resize_focused_pane(2),
+                KeyCode::Char('0') => {
+                    self.layout = self.layout_baseline.clone();
+                    self.status = Some("Layout overrides reset".to_owned());
+                    AppAction::LayoutReset
+                }
+                _ => AppAction::None,
+            };
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -781,6 +836,11 @@ impl App {
                 self.loading = true;
                 AppAction::Refresh
             }
+            KeyCode::Char('L') => {
+                self.layout.mode = self.layout.mode.toggled();
+                self.status = Some(format!("{}-pane layout requested", self.layout.mode));
+                AppAction::LayoutChanged(self.layout.clone())
+            }
             KeyCode::Char('t') => {
                 self.set_focus(FocusPane::Thread);
                 AppAction::None
@@ -813,16 +873,20 @@ impl App {
                 self.select_last();
                 AppAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.toggle_panel_focus();
+            KeyCode::Tab => {
+                self.cycle_visible_panes(true);
+                AppAction::None
+            }
+            KeyCode::BackTab => {
+                self.cycle_visible_panes(false);
                 AppAction::None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.focus_secondary_panel();
+                self.move_focus_spatially(true);
                 AppAction::None
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.set_focus(FocusPane::Stories);
+                self.move_focus_spatially(false);
                 AppAction::None
             }
             KeyCode::Char('[') => self.change_feed(-1),
@@ -1043,18 +1107,48 @@ impl App {
         .min(self.detail_max_scroll);
     }
 
-    fn focus_secondary_panel(&mut self) {
-        self.set_focus(match self.secondary {
-            SecondaryPane::Thread => FocusPane::Thread,
-            SecondaryPane::Detail => FocusPane::Detail,
-        });
+    fn cycle_visible_panes(&mut self, forward: bool) {
+        let panes: Vec<_> = self.visible_panes.ordered().collect();
+        let Some(index) = panes.iter().position(|pane| *pane == self.focus) else {
+            return;
+        };
+        let next = if forward {
+            (index + 1) % panes.len()
+        } else {
+            index.checked_sub(1).unwrap_or(panes.len() - 1)
+        };
+        self.set_focus(panes[next]);
     }
 
-    fn toggle_panel_focus(&mut self) {
-        if self.focus == FocusPane::Stories {
-            self.focus_secondary_panel();
+    fn move_focus_spatially(&mut self, right: bool) {
+        let panes: Vec<_> = self.visible_panes.ordered().collect();
+        let Some(index) = panes.iter().position(|pane| *pane == self.focus) else {
+            return;
+        };
+        let next = if right {
+            index.checked_add(1).filter(|next| *next < panes.len())
         } else {
-            self.set_focus(FocusPane::Stories);
+            index.checked_sub(1)
+        };
+        if let Some(next) = next {
+            self.set_focus(panes[next]);
+        }
+    }
+
+    fn resize_focused_pane(&mut self, delta: i8) -> AppAction {
+        match self
+            .layout
+            .resized_for(self.resolved_mode, self.focus, delta)
+        {
+            Ok(layout) => {
+                self.layout = layout;
+                self.status = Some(format!("{} pane resized", self.focus.label()));
+                AppAction::LayoutChanged(self.layout.clone())
+            }
+            Err(error) => {
+                self.status = Some(error.to_string());
+                AppAction::None
+            }
         }
     }
 
@@ -1281,6 +1375,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    fn alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
     #[test]
     fn selection_and_scroll_follow_viewport() {
         let mut app = App::new(page());
@@ -1413,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_keys_move_between_two_physical_panels() {
+    fn navigation_follows_the_last_rendered_pane_set() {
         let mut app = App::new(page());
 
         let _ = app.handle_key(key(KeyCode::Tab));
@@ -1423,6 +1521,10 @@ mod tests {
 
         let _ = app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.focus(), FocusPane::Detail);
+        app.set_rendered_panes(
+            crate::layout::PaneSet::two(super::SecondaryPane::Detail),
+            crate::layout::ResolvedMode::Two,
+        );
         let _ = app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.focus(), FocusPane::Stories);
         let _ = app.handle_key(key(KeyCode::Char('l')));
@@ -1433,6 +1535,80 @@ mod tests {
         let _ = app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.focus(), FocusPane::Thread);
         assert_eq!(app.secondary_pane(), super::SecondaryPane::Thread);
+    }
+
+    #[test]
+    fn three_pane_navigation_cycles_and_stops_at_spatial_edges() {
+        let mut app = App::new(page());
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+
+        let _ = app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Thread);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        let _ = app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus(), FocusPane::Detail);
+    }
+
+    #[test]
+    fn layout_toggle_resize_and_reset_emit_persistence_actions() {
+        let mut app = App::new(page());
+        let baseline = crate::layout::LayoutPreferences::default();
+        app.configure_layout(baseline.clone(), baseline.clone());
+
+        let action = app.handle_key(key(KeyCode::Char('L')));
+        assert!(matches!(action, AppAction::LayoutChanged(_)));
+        assert_eq!(
+            app.layout_preferences().mode,
+            crate::layout::PaneMode::Three
+        );
+
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+        let action = app.handle_key(alt_key(KeyCode::Char('l')));
+        assert!(matches!(action, AppAction::LayoutChanged(_)));
+        assert_eq!(app.layout_preferences().three, [40, 32, 28]);
+
+        assert_eq!(
+            app.handle_key(alt_key(KeyCode::Char('0'))),
+            AppAction::LayoutReset
+        );
+        assert_eq!(app.layout_preferences(), &baseline);
+    }
+
+    #[test]
+    fn rejected_resize_is_nonfatal_and_preserves_state() {
+        let mut app = App::new(page());
+        let preferences = crate::layout::LayoutPreferences {
+            two: [85, 15],
+            ..crate::layout::LayoutPreferences::default()
+        };
+        app.configure_layout(
+            preferences.clone(),
+            crate::layout::LayoutPreferences::default(),
+        );
+        app.set_rendered_panes(
+            crate::layout::PaneSet::two(super::SecondaryPane::Thread),
+            crate::layout::ResolvedMode::Two,
+        );
+
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('l'))), AppAction::None);
+        assert_eq!(app.layout_preferences(), &preferences);
+        assert!(
+            app.status()
+                .is_some_and(|status| status.contains("rejected"))
+        );
     }
 
     #[test]

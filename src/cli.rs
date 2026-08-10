@@ -1237,6 +1237,16 @@ async fn run_tui(
                                         app.set_error(format!("Could not update bookmark: {error}"));
                                     }
                                 }
+                                AppAction::LayoutChanged(layout) => {
+                                    if let Err(error) = cache.set_json_setting("layout.v1", &layout) {
+                                        app.set_status(format!("Layout changed but was not saved: {error}"));
+                                    }
+                                }
+                                AppAction::LayoutReset => {
+                                    if let Err(error) = cache.remove_setting("layout.v1") {
+                                        app.set_status(format!("Layout reset but saved override remains: {error}"));
+                                    }
+                                }
                             }
                             redraw = true;
                         }

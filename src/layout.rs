@@ -99,9 +99,24 @@ impl LayoutPreferences {
 
     /// Resizes the focused pane by percentage points while retaining a 15% minimum.
     pub fn resized(&self, focus: FocusPane, delta: i8) -> Result<Self, LayoutError> {
+        let mode = match self.mode {
+            PaneMode::Two => ResolvedMode::Two,
+            PaneMode::Three => ResolvedMode::Three,
+        };
+        self.resized_for(mode, focus, delta)
+    }
+
+    /// Resizes the divider in the currently resolved layout.
+    pub fn resized_for(
+        &self,
+        mode: ResolvedMode,
+        focus: FocusPane,
+        delta: i8,
+    ) -> Result<Self, LayoutError> {
         let mut next = self.clone();
-        match self.mode {
-            PaneMode::Two => {
+        match mode {
+            ResolvedMode::One => return Err(LayoutError::ResizeUnavailable),
+            ResolvedMode::Two => {
                 let left_delta = if focus == FocusPane::Stories {
                     delta
                 } else {
@@ -109,7 +124,7 @@ impl LayoutPreferences {
                 };
                 adjust_pair(&mut next.two, 0, 1, left_delta)?;
             }
-            PaneMode::Three => match focus {
+            ResolvedMode::Three => match focus {
                 FocusPane::Stories => adjust_pair(&mut next.three, 0, 1, delta)?,
                 FocusPane::Thread => adjust_pair(&mut next.three, 1, 2, delta)?,
                 FocusPane::Detail => adjust_pair(&mut next.three, 2, 1, delta)?,
@@ -300,6 +315,8 @@ pub enum LayoutError {
     BreakpointOrder { two: u16, three: u16 },
     #[error("pane resize rejected; every pane must remain at least {0}%")]
     ResizeRejected(u8),
+    #[error("pane resizing is unavailable while only one pane is visible")]
+    ResizeUnavailable,
 }
 
 #[cfg(test)]
