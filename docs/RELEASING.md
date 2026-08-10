@@ -21,9 +21,10 @@ dist generate --check
 dist plan
 ```
 
-Then update `CHANGELOG.md` and `Cargo.toml`, commit, tag, and push the tag. The
-crate is published separately with `cargo publish` after the GitHub artifacts
-pass smoke tests.
+Then update `VERSION` and `CHANGELOG.md`. Map four-part `VERSION` value
+`A.B.C.D` to version `A.B.C` in `Cargo.toml` and `Cargo.lock`, commit, tag, and
+push the tag. The crate is published separately with `cargo publish` after the
+GitHub artifacts pass smoke tests.
 
 Homebrew publication requires an initialized `homebrew-tap` repository and a
 `HOMEBREW_TAP_TOKEN`; enable cargo-dist's `homebrew` installer only after those

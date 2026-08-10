@@ -108,9 +108,11 @@ cargo test --all-targets
 cargo bench
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md), and
-[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
+Project guides: [architecture](docs/ARCHITECTURE.md),
+[dependencies](docs/DEPENDENCIES.md), [performance](docs/PERFORMANCE.md),
+[themes](docs/THEMES.md), [releasing](docs/RELEASING.md),
+[contributing](CONTRIBUTING.md), the [security policy](SECURITY.md), and the
+[changelog](CHANGELOG.md).
 
 ## Provenance and naming
 
