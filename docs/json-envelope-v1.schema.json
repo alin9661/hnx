@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alin9661/hnx/blob/main/docs/json-envelope-v1.schema.json",
+  "title": "hnx JSON envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "stale", "fetched_at", "data"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "source": {
+      "type": "string",
+      "enum": ["algolia", "firebase", "hybrid", "cache"]
+    },
+    "stale": { "type": "boolean" },
+    "fetched_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp in UTC seconds"
+    },
+    "data": {
+      "description": "Command-specific payload"
+    }
+  }
+}
