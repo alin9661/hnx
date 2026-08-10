@@ -72,8 +72,9 @@ pub fn layout_for(
     }
 }
 
-/// Draws the complete interface. Rendering has no clock/tick dependency; it only records the
-/// current viewport capacities so subsequent navigation can keep selections visible.
+/// Draws the complete interface. Rendering has no clock/tick dependency; it records the current
+/// pane visibility, viewport capacities, and Detail extent so subsequent navigation remains
+/// aligned with what is on screen.
 pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     let area = frame.area();
     if area.is_empty() {
@@ -139,19 +140,36 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .fg(theme.accent_fg)
         .bg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled(" Y  hnx ", masthead_style)];
-    for (index, feed) in Feed::ALL.iter().enumerate() {
-        let label = if index == selected {
-            format!(" ◆ {} ", feed.label())
-        } else {
-            format!("   {} ", feed.label())
-        };
+    let brand = " hnx ";
+    let labels: Vec<_> = Feed::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, feed)| {
+            if index == selected {
+                format!(" ◆ {} ", feed.label())
+            } else {
+                format!("   {} ", feed.label())
+            }
+        })
+        .collect();
+    let full_width = brand.chars().count()
+        + labels
+            .iter()
+            .map(|label| label.chars().count())
+            .sum::<usize>();
+    let visible_labels: Vec<_> = if full_width <= usize::from(area.width) {
+        labels.iter().enumerate().collect()
+    } else {
+        vec![(selected, &labels[selected])]
+    };
+    let mut spans = vec![Span::styled(brand, masthead_style)];
+    for (index, label) in visible_labels {
         let style = if index == selected {
             masthead_style.add_modifier(Modifier::UNDERLINED)
         } else {
             masthead_style
         };
-        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(label.clone(), style));
     }
     if let Some(query) = app.search_query() {
         spans.push(Span::styled(
@@ -539,19 +557,32 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMod
         ));
     }
 
-    let focus = format!("{} · {}", mode_label(mode), app.focus().label());
-    state.push(Span::styled(format!(" {focus} "), theme.muted_style()));
-    let hints = if area.width >= 100 {
-        "  ? help · q quit · Tab pane · L layout · Alt+h/l resize · Alt+0 reset"
-    } else if area.width >= 64 {
-        "  ? help · q quit · Tab pane · L layout"
-    } else {
-        "  ? help · q quit"
+    let hints = match (mode, area.width) {
+        (ResolvedMode::One, _) => "? help · q quit",
+        (_, 100..) => "? help · q quit · Tab pane · L layout · Alt+h/l resize · Alt+0 reset",
+        (_, 64..) => "? help · q quit · Tab pane · L layout",
+        _ => "? help · q quit",
     };
-    state.push(Span::styled(hints, theme.muted_style()));
+    let suffix = format!(" {} · {} · {hints} ", mode_label(mode), app.focus().label());
+    let suffix_width = u16::try_from(suffix.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let message_width = area.width.saturating_sub(suffix_width);
+    let message_area = Rect::new(area.x, area.y, message_width, area.height);
+    let suffix_area = Rect::new(
+        area.x.saturating_add(message_width),
+        area.y,
+        suffix_width,
+        area.height,
+    );
 
-    let lines = vec![Line::from(state)];
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(Line::from(state)), message_area);
+    frame.render_widget(
+        Paragraph::new(suffix)
+            .style(theme.muted_style())
+            .alignment(Alignment::Right),
+        suffix_area,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -987,6 +1018,25 @@ mod tests {
     }
 
     #[test]
+    fn narrow_masthead_keeps_the_active_feed_visible() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut jobs_page = page();
+        jobs_page.feed = Feed::Jobs;
+        let mut app = App::new(jobs_page);
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("narrow frame renders");
+        let buffer = terminal.backend().buffer();
+
+        assert!(cells_for(buffer, "Jobs").all(|cell| {
+            cell.modifier.contains(Modifier::BOLD) && cell.modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+        assert!(find_run(buffer, "hnx").0 < find_run(buffer, "Jobs").0);
+    }
+
+    #[test]
     fn classic_primary_metadata_and_selection_styles_are_semantic() {
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1066,6 +1116,7 @@ mod tests {
                 Comment {
                     id: 10,
                     by: Some("root".to_owned()),
+                    text: Some("root comment body".to_owned()),
                     ..Comment::default()
                 },
                 Comment {
@@ -1097,12 +1148,67 @@ mod tests {
     }
 
     #[test]
+    fn all_primary_content_categories_render_bold() {
+        let backend = TestBackend::new(120, 22);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.configure_layout(
+            LayoutPreferences::default().with_mode(PaneMode::Three),
+            LayoutPreferences::default(),
+        )
+        .expect("layout validates");
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("commenter".to_owned()),
+                text: Some("comment body text".to_owned()),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        app.set_article(ArticleView::new(
+            "Article heading",
+            Some("https://example.com/read".to_owned()),
+            "article body text",
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("three-pane content renders");
+        let buffer = terminal.backend().buffer();
+
+        for text in [
+            "Stories",
+            "Thread",
+            "Detail / article",
+            "commenter",
+            "comment body text",
+            "Article heading",
+            "article body text",
+        ] {
+            assert!(
+                cells_for(buffer, text).all(|cell| cell.modifier.contains(Modifier::BOLD)),
+                "{text} should be bold"
+            );
+        }
+        assert!(
+            cells_for(buffer, "https://example.com/read")
+                .all(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+        );
+    }
+
+    #[test]
     fn every_responsive_boundary_renders_the_expected_mode() {
         for (width, expected_mode, expects_tab_hint) in [
             (120, "2-pane", true),
             (119, "2-pane", true),
             (80, "2-pane", true),
-            (79, "1-pane", true),
+            (79, "1-pane", false),
         ] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1125,6 +1231,30 @@ mod tests {
             assert!(rendered.contains("? help"));
             assert!(rendered.contains("q quit"));
             assert_eq!(rendered.contains("Tab pane"), expects_tab_hint);
+        }
+    }
+
+    #[test]
+    fn long_status_messages_never_hide_focus_or_recovery_hints() {
+        for width in [50, 79, 80] {
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            app.set_error("a very long recoverable error ".repeat(12));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("status frame renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+
+            assert!(rendered.contains("stories"), "focus missing at {width}");
+            assert!(rendered.contains("? help"), "help missing at {width}");
+            assert!(rendered.contains("q quit"), "quit missing at {width}");
         }
     }
 
