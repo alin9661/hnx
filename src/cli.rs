@@ -36,6 +36,7 @@ use crate::{
     app::{App, AppAction, ArticleView},
     article::{Article as FetchedArticle, ArticleClient},
     cache::{Cache, CacheEntry, CacheError},
+    config::{LayoutOverride, resolve_layout},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
     sanitize::{sanitize_single_line, sanitize_text, validate_url},
     theme::Theme,
@@ -66,6 +67,14 @@ struct Cli {
     /// Built-in theme name or path to a custom TOML theme.
     #[arg(long, global = true)]
     theme: Option<String>,
+
+    /// Load layout preferences from this TOML file.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Override and save the pane layout: two[:STORIES], three[:STORIES,THREAD], or reset.
+    #[arg(long, global = true, value_name = "LAYOUT")]
+    layout: Option<LayoutOverride>,
 
     /// Write opt-in diagnostics to a local file.
     #[arg(long, global = true, value_name = "PATH")]
@@ -229,7 +238,16 @@ pub async fn run() -> Result<(), CliError> {
         .map_or_else(Cache::open_default, Cache::open_in_dir)?;
 
     match cli.command {
-        None => run_tui(cache, cli.offline, cli.theme.as_deref()).await,
+        None => {
+            run_tui(
+                cache,
+                cli.offline,
+                cli.theme.as_deref(),
+                cli.config.as_deref(),
+                cli.layout.as_ref(),
+            )
+            .await
+        }
         Some(Command::Feed {
             feed,
             limit,
@@ -990,14 +1008,38 @@ async fn run_tui(
     cache: Cache,
     offline: bool,
     requested_theme: Option<&str>,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
 ) -> Result<(), CliError> {
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
+    let (stored_layout, stored_read_warning) = match cache.get_setting("layout.v1") {
+        Ok(value) => (value, None),
+        Err(_) => (
+            None,
+            Some("Could not read saved layout; using config or built-in defaults".to_owned()),
+        ),
+    };
+    let layout = resolve_layout(config_path, stored_layout.as_deref(), layout_override)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+    let mut layout_warning = stored_read_warning.or(layout.warning.clone());
+    if layout.reset_saved {
+        if cache.remove_setting("layout.v1").is_err() {
+            layout_warning.get_or_insert_with(|| {
+                "Layout reset, but the saved override could not be removed".to_owned()
+            });
+        }
+    } else if layout.persist_cli && cache.set_json_setting("layout.v1", &layout.active).is_err() {
+        layout_warning.get_or_insert_with(|| {
+            "Layout applied, but the preference could not be saved".to_owned()
+        });
+    }
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
         || App::empty(Feed::Top),
         |entry| App::new(cache_page(entry, Some(DEFAULT_LIMIT))),
     );
+    app.configure_layout(layout.active, layout.baseline);
     app.set_bookmarks(cache.bookmarks()?.into_iter().map(|item| item.id));
     if offline {
         app.set_offline(true);
@@ -1005,7 +1047,7 @@ async fn run_tui(
             app.set_error("No cached top feed is available offline");
         }
     }
-    if let Some(warning) = theme_warning
+    if let Some(warning) = theme_warning.or(layout_warning)
         && app.error().is_none()
     {
         app.set_status(warning);
@@ -1585,6 +1627,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_layout_and_config_options_with_clap_validation() {
+        let cli =
+            Cli::try_parse_from(["hnx", "--config", "custom.toml", "--layout", "three:38,34"])
+                .expect("layout options parse");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("custom.toml"))
+        );
+        assert!(matches!(
+            cli.layout,
+            Some(crate::config::LayoutOverride::Apply {
+                mode: crate::layout::PaneMode::Three,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["hnx", "--layout", "two:10"]).is_err());
+        assert!(Cli::try_parse_from(["hnx", "--layout", "three:50,60"]).is_err());
     }
 
     #[test]
