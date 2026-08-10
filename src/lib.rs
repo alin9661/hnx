@@ -2,9 +2,11 @@
 
 pub mod api;
 pub mod article;
+pub mod cache;
 pub mod model;
 pub mod sanitize;
 pub mod theme;
 
 pub use api::{ApiError, DataSource, HybridClient, SearchType};
+pub use cache::Cache;
 pub use model::{Comment, Feed, Item, PollOption, Source, StoryPage, Thread, ThreadMetadata};
