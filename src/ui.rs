@@ -208,9 +208,18 @@ fn render_stories(
     let block = pane_block(title, app.focus() == FocusPane::Stories, separator, theme);
 
     let offset = app.story_offset();
+    let selected = app.selected_story_index();
     let items: Vec<ListItem<'_>> = app
         .visible_item_window(offset, capacity)
-        .map(|item| story_row(item, app.is_bookmarked(item.id), theme))
+        .enumerate()
+        .map(|(relative, item)| {
+            story_row(
+                item,
+                app.is_bookmarked(item.id),
+                selected == Some(offset.saturating_add(relative)),
+                theme,
+            )
+        })
         .collect();
 
     if items.is_empty() {
@@ -233,8 +242,7 @@ fn render_stories(
         return;
     }
 
-    let selected = app
-        .selected_story_index()
+    let selected = selected
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < items.len());
     let mut state = ListState::default().with_selected(selected);
@@ -246,12 +254,12 @@ fn render_stories(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> {
+fn story_row(item: &Item, bookmarked: bool, selected: bool, theme: &Theme) -> ListItem<'static> {
     let marker = if bookmarked { "★ " } else { "  " };
     let title_style = if item.is_unavailable() {
         theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
     } else {
-        theme.primary_style()
+        primary_style(theme, selected)
     };
     let title = Line::from(vec![
         Span::styled(marker, Style::default().fg(theme.warning)),
@@ -270,7 +278,7 @@ fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> 
         format!("  {} pts · {} comments · ", item.score, item.descendants),
         theme.muted_style(),
     )];
-    metadata.push(Span::styled(author, theme.primary_style()));
+    metadata.push(Span::styled(author, primary_style(theme, selected)));
     let suffix = if age.is_empty() {
         format!(" · {domain}")
     } else {
@@ -316,9 +324,18 @@ fn render_thread(
     }
 
     let offset = app.comment_offset();
+    let selected = app.selected_comment_index();
     let comments: Vec<ListItem<'_>> = app
         .visible_comment_window(offset, capacity)
-        .map(|comment| comment_row(comment, app.is_comment_collapsed(comment.id), theme))
+        .enumerate()
+        .map(|(relative, comment)| {
+            comment_row(
+                comment,
+                app.is_comment_collapsed(comment.id),
+                selected == Some(offset.saturating_add(relative)),
+                theme,
+            )
+        })
         .collect();
     if comments.is_empty() {
         frame.render_widget(
@@ -330,8 +347,7 @@ fn render_thread(
         return;
     }
 
-    let selected = app
-        .selected_comment_index()
+    let selected = selected
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < comments.len());
     let mut state = ListState::default().with_selected(selected);
@@ -343,7 +359,12 @@ fn render_thread(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'static> {
+fn comment_row(
+    comment: &Comment,
+    collapsed: bool,
+    selected: bool,
+    theme: &Theme,
+) -> ListItem<'static> {
     let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
     let fold = if collapsed {
         "▸"
@@ -360,7 +381,7 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
     let age = age(comment.time);
     let mut metadata = depth_rails(depth, theme);
     metadata.push(Span::styled(format!("{fold} "), theme.muted_style()));
-    metadata.push(Span::styled(author, theme.primary_style()));
+    metadata.push(Span::styled(author, primary_style(theme, selected)));
     if !age.is_empty() {
         metadata.push(Span::styled(format!(" · {age}"), theme.muted_style()));
     }
@@ -378,12 +399,20 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
                 depth_rails(depth, theme),
                 vec![
                     Span::styled("  ", theme.muted_style()),
-                    Span::styled(body, theme.primary_style()),
+                    Span::styled(body, primary_style(theme, selected)),
                 ],
             ]
             .concat(),
         ),
     ])
+}
+
+fn primary_style(theme: &Theme, selected: bool) -> Style {
+    if selected {
+        theme.primary_style().fg(theme.selected_fg)
+    } else {
+        theme.primary_style()
+    }
 }
 
 fn depth_rails(depth: usize, theme: &Theme) -> Vec<Span<'static>> {
@@ -563,7 +592,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMod
         (_, 64..) => "? help · q quit · Tab pane · L layout",
         _ => "? help · q quit",
     };
-    let suffix = format!(" {} · {} · {hints} ", mode_label(mode), app.focus().label());
+    let suffix = status_suffix(mode, app.focus(), hints, area.width);
     let suffix_width = u16::try_from(suffix.chars().count())
         .unwrap_or(u16::MAX)
         .min(area.width);
@@ -591,7 +620,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         return;
     }
     frame.render_widget(Clear, popup);
-    let help = vec![
+    let full_help = vec![
         Line::styled("Navigation", theme.accent_style()),
         Line::raw("j/k or ↑/↓   move selection / scroll article"),
         Line::raw("h/l or ←/→   move between panes"),
@@ -615,11 +644,25 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw(""),
         Line::raw("a article · o browser · O offline · r refresh · ? close help · q quit"),
     ];
+    let compact_help = vec![
+        Line::styled("Navigation", theme.accent_style()),
+        Line::raw("j/k move · h/l pane · Tab cycle · Enter open/fold"),
+        Line::styled("Layout", theme.accent_style()),
+        Line::raw("L toggle · Alt+h/l resize · Alt+0 reset"),
+        Line::styled("Find and save", theme.accent_style()),
+        Line::raw("/ search · f filter · b save · B saved only"),
+        Line::raw("a article · o browser · O offline · r refresh"),
+    ];
+    let help = if area.height < 24 {
+        compact_help
+    } else {
+        full_help
+    };
     frame.render_widget(
         Paragraph::new(help)
             .block(
                 Block::default()
-                    .title(" Keyboard help ")
+                    .title(" Keyboard help · Esc/? close ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.highlight)),
             )
@@ -704,6 +747,23 @@ fn mode_label(mode: ResolvedMode) -> &'static str {
     }
 }
 
+fn status_suffix(mode: ResolvedMode, focus: FocusPane, hints: &str, width: u16) -> String {
+    let recovery = " ? help · q quit ";
+    let compact_recovery = " ? · q ";
+    let focus_and_recovery = format!(" {} ·{recovery}", focus.label());
+    let full = format!(" {} · {} · {hints} ", mode_label(mode), focus.label());
+    for candidate in [full, focus_and_recovery, recovery.to_owned()] {
+        if candidate.chars().count() <= usize::from(width) {
+            return candidate;
+        }
+    }
+    if compact_recovery.chars().count() <= usize::from(width) {
+        compact_recovery.to_owned()
+    } else {
+        " q ".to_owned()
+    }
+}
+
 fn hostname(url: &str) -> Option<&str> {
     let without_scheme = url
         .strip_prefix("https://")
@@ -784,7 +844,7 @@ fn strip_html(input: &str) -> String {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Modifier};
 
-    use super::{centered_rect, layout_for, render};
+    use super::{centered_rect, layout_for, render, status_suffix};
     use crate::{
         app::{App, ArticleView, FocusPane, SecondaryPane},
         layout::{LayoutPreferences, PaneMode, ResolvedMode},
@@ -1067,6 +1127,7 @@ mod tests {
         let mut custom = Theme::midnight();
         custom.accent = ratatui::style::Color::Rgb(1, 2, 3);
         custom.accent_fg = ratatui::style::Color::Rgb(250, 249, 248);
+        custom.selected_fg = ratatui::style::Color::Rgb(247, 17, 219);
         let backend = TestBackend::new(90, 18);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::new(page());
@@ -1080,6 +1141,12 @@ mod tests {
                 .cell((x, 0))
                 .is_some_and(|cell| cell.bg == custom.accent && cell.fg == custom.accent_fg)
         }));
+        let custom_buffer = terminal.backend().buffer();
+        assert!(
+            cells_for(custom_buffer, "A carefully rendered story")
+                .all(|cell| cell.fg == custom.selected_fg)
+        );
+        assert!(cells_for(custom_buffer, "123 pts").all(|cell| cell.fg == custom.muted));
 
         let backend = TestBackend::new(90, 18);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1255,6 +1322,72 @@ mod tests {
             assert!(rendered.contains("stories"), "focus missing at {width}");
             assert!(rendered.contains("? help"), "help missing at {width}");
             assert!(rendered.contains("q quit"), "quit missing at {width}");
+        }
+    }
+
+    #[test]
+    fn ultra_narrow_status_prioritizes_recovery_then_focus_then_mode() {
+        let full = status_suffix(
+            ResolvedMode::One,
+            FocusPane::Stories,
+            "? help · q quit",
+            u16::MAX,
+        );
+        let full_width = u16::try_from(full.chars().count()).expect("suffix width fits");
+        for (width, expected, omitted) in [
+            (20, "? help · q quit", "stories"),
+            (30, "stories", "1-pane"),
+            (full_width, "1-pane", "never omitted"),
+        ] {
+            let backend = TestBackend::new(width, 8);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("narrow status renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            assert!(rendered.contains(expected), "missing {expected} at {width}");
+            if omitted != "never omitted" {
+                assert!(
+                    !rendered.contains(omitted),
+                    "unexpected {omitted} at {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_help_keeps_dismissal_and_all_categories_visible() {
+        for height in [12, 20] {
+            let backend = TestBackend::new(100, height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            let _ = app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("short help renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            for expected in ["Esc/? close", "Navigation", "Layout", "Find and save"] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected} at height {height}"
+                );
+            }
         }
     }
 
