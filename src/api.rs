@@ -594,7 +594,7 @@ impl HybridClient {
         }
         let comments = children
             .into_iter()
-            .filter_map(|child| algolia_comment(child, 0))
+            .filter_map(|child| algolia_comment(child, 0, self.max_thread_depth))
             .collect();
 
         Ok(Thread {
@@ -1100,13 +1100,22 @@ impl AlgoliaItem {
     }
 }
 
-fn algolia_comment(raw: AlgoliaItem, depth: u32) -> Option<Comment> {
+/// Converts one Algolia record and its nested children into a [`Comment`].
+///
+/// `max_depth` bounds the recursion exactly as the Firebase traversal does.
+/// Beyond it the node is dropped while its id stays in the parent's `kids`, so
+/// [`Thread::metadata`] reports the tree as partial with the omitted ids listed
+/// rather than silently returning a truncated tree.
+fn algolia_comment(raw: AlgoliaItem, depth: u32, max_depth: u32) -> Option<Comment> {
+    if depth > max_depth {
+        return None;
+    }
     let id = raw.id.filter(|id| *id > 0)?;
     let kids = raw.children.iter().filter_map(|child| child.id).collect();
     let children = raw
         .children
         .into_iter()
-        .filter_map(|child| algolia_comment(child, depth.saturating_add(1)))
+        .filter_map(|child| algolia_comment(child, depth.saturating_add(1), max_depth))
         .collect();
     Some(Comment {
         id,
@@ -1773,6 +1782,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![701, 702]
         );
+    }
+
+    #[tokio::test]
+    async fn algolia_depth_cap_matches_firebase_and_reports_partial() {
+        let server = MockServer::start().await;
+        // Algolia returns a three-deep chain in one response; the depth cap has
+        // to bound the recursive conversion, not just the Firebase fan-out.
+        Mock::given(method("GET"))
+            .and(path("/items/900"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 900,
+                "type": "story",
+                "title": "nested",
+                "num_comments": 3,
+                "children": [{
+                    "id": 901,
+                    "type": "comment",
+                    "parent_id": 900,
+                    "children": [{
+                        "id": 902,
+                        "type": "comment",
+                        "parent_id": 901,
+                        "children": [{
+                            "id": 903,
+                            "type": "comment",
+                            "parent_id": 902
+                        }]
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/item/900.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = HybridClient::with_base_urls(server.uri(), server.uri())
+            .expect("test URLs are valid")
+            .with_thread_limits(100, 1, Duration::from_secs(1));
+        let thread = client.thread(900).await.expect("bounded thread loads");
+
+        // Same shape the Firebase depth-cap test asserts: two nodes kept, the
+        // over-depth id left unresolved rather than silently dropped.
+        assert_eq!(thread.comment_count(), 2);
+        assert_eq!(thread.comments[0].children[0].depth, 1);
+        assert!(thread.is_partial());
+        assert_eq!(thread.metadata().unresolved_ids, vec![903]);
     }
 
     #[tokio::test]
