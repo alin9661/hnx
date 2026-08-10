@@ -1,0 +1,21 @@
+{
+  "version": "@VERSION@",
+  "description": "A fast, cache-first Hacker News terminal client",
+  "homepage": "https://github.com/alin9661/hnx",
+  "license": "MIT OR Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/alin9661/hnx/releases/download/v@VERSION@/hnx-x86_64-pc-windows-msvc.zip",
+      "hash": "@SHA256@"
+    }
+  },
+  "bin": "hnx.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/alin9661/hnx/releases/download/v$version/hnx-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  }
+}
