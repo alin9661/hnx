@@ -81,17 +81,17 @@ impl Theme {
     pub fn classic() -> Self {
         Self {
             name: "classic".to_owned(),
-            background: Color::Rgb(246, 246, 239),
+            background: Color::Rgb(247, 246, 240),
             foreground: Color::Rgb(20, 20, 20),
             muted: Color::Rgb(112, 112, 106),
-            accent: Color::Rgb(196, 72, 0),
-            highlight: Color::Rgb(153, 55, 0),
+            accent: Color::Rgb(255, 102, 0),
+            highlight: Color::Rgb(196, 72, 0),
             success: Color::Rgb(26, 127, 55),
             warning: Color::Rgb(158, 92, 0),
             error: Color::Rgb(190, 35, 35),
             border: Color::Rgb(183, 183, 174),
             selected_fg: Color::Black,
-            selected_bg: Color::Rgb(255, 176, 122),
+            selected_bg: Color::Rgb(255, 102, 0),
             link: Color::Rgb(26, 82, 160),
         }
     }
@@ -218,8 +218,13 @@ impl Theme {
         apply_color!(background);
         apply_color!(foreground);
         apply_color!(muted);
+        let accent_overridden = file.colors.accent.is_some();
         apply_color!(accent);
-        apply_color!(highlight);
+        if let Some(value) = file.colors.highlight {
+            theme.highlight = value.parse("highlight")?;
+        } else if accent_overridden {
+            theme.highlight = theme.accent;
+        }
         apply_color!(success);
         apply_color!(warning);
         apply_color!(error);
@@ -244,7 +249,7 @@ impl Theme {
     #[must_use]
     pub fn accent_style(&self) -> Style {
         self.base_style()
-            .fg(self.accent)
+            .fg(self.highlight)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -355,6 +360,15 @@ mod tests {
     #[test]
     fn builtins_have_stable_semantic_palettes() {
         assert_eq!(Theme::default(), Theme::classic());
+        let classic = Theme::classic();
+        assert_eq!(classic.background, Color::Rgb(247, 246, 240));
+        assert_eq!(classic.accent, Color::Rgb(255, 102, 0));
+        assert_eq!(classic.highlight, Color::Rgb(196, 72, 0));
+        assert_eq!(classic.selected_fg, Color::Black);
+        assert_eq!(classic.selected_bg, Color::Rgb(255, 102, 0));
+        assert_eq!(classic.accent_style().fg, Some(classic.highlight));
+        assert_eq!(classic.selected_style().fg, Some(Color::Black));
+        assert_eq!(classic.selected_style().bg, Some(classic.accent));
         assert_eq!(
             Theme::named("dark").expect("theme resolves"),
             Theme::midnight()
@@ -395,8 +409,25 @@ mod tests {
         assert_eq!(theme.name, "ocean");
         assert_eq!(theme.background, Color::Rgb(0, 17, 34));
         assert_eq!(theme.accent, Color::Rgb(10, 20, 30));
+        assert_eq!(theme.highlight, theme.accent);
         assert_eq!(theme.selected_bg, Color::Indexed(24));
         assert_eq!(theme.foreground, Theme::midnight().foreground);
+    }
+
+    #[test]
+    fn explicit_highlight_wins_over_the_custom_accent_fallback() {
+        let theme = Theme::from_toml(
+            r##"
+                [colors]
+                accent = "#ff6600"
+                highlight = "#c44800"
+            "##,
+        )
+        .expect("theme parses");
+
+        assert_eq!(theme.accent, Color::Rgb(255, 102, 0));
+        assert_eq!(theme.highlight, Color::Rgb(196, 72, 0));
+        assert_eq!(theme.accent_style().fg, Some(theme.highlight));
     }
 
     #[test]
@@ -412,6 +443,7 @@ mod tests {
         let theme = Theme::load(path).expect("theme loads");
         assert_eq!(theme.name, "portable");
         assert_eq!(theme.accent, Color::Cyan);
+        assert_eq!(theme.highlight, Color::Cyan);
     }
 
     #[test]
