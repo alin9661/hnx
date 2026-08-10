@@ -1,0 +1,55 @@
+[package]
+name = "hnx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast, cache-first Hacker News terminal client"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alin9661/hnx"
+readme = "README.md"
+keywords = ["hacker-news", "terminal", "ratatui", "tui", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6.0"
+futures = "0.3"
+html2text = "0.17"
+open = "5.3"
+ratatui = "0.30.2"
+regex = "1.11"
+reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "http2", "json", "query", "rustls", "stream"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "serde_json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3.20"
+wiremock = "0.6"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
