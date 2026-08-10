@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-10
+
 ### Added
 
 - Cache-first Hacker News feeds, search, items, and threaded comments.
@@ -20,3 +22,6 @@ All notable changes to this project are documented here. The format follows
   revalidate TUI loading.
 - DNS-rebinding-safe, bounded in-terminal article reading.
 - Checksummed multi-platform cargo-dist releases with SBOMs and attestations.
+
+[Unreleased]: https://github.com/alin9661/hnx/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/alin9661/hnx/releases/tag/v0.1.0
