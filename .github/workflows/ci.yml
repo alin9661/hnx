@@ -83,3 +83,23 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  release-smoke:
+    name: Release smoke and size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: ./target/release/hnx --version
+      - name: Enforce 15 MiB binary budget
+        shell: bash
+        run: |
+          size=$(stat -c %s target/release/hnx)
+          echo "release binary: $size bytes"
+          test "$size" -le 15728640
