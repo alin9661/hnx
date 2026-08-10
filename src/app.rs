@@ -239,6 +239,7 @@ pub struct App {
     comment_selection: Selection,
     detail_scroll: u16,
     detail_viewport: usize,
+    detail_max_scroll: u16,
     filter: String,
     filter_regex: Option<regex::Regex>,
     search_query: Option<String>,
@@ -286,6 +287,7 @@ impl App {
             comment_selection: Selection::empty(),
             detail_scroll: 0,
             detail_viewport: 1,
+            detail_max_scroll: 0,
             filter: String::new(),
             filter_regex: None,
             search_query: None,
@@ -697,9 +699,12 @@ impl App {
             .set_viewport(comment_rows, comment_count);
     }
 
-    /// Records the number of wrapped article rows visible in the Detail pane.
-    pub(crate) fn set_detail_viewport(&mut self, rows: usize) {
-        self.detail_viewport = rows.max(1);
+    /// Records the rendered Detail extent and clamps scroll after content or width changes.
+    pub(crate) fn set_detail_metrics(&mut self, viewport_rows: usize, content_rows: usize) {
+        self.detail_viewport = viewport_rows.max(1);
+        self.detail_max_scroll =
+            u16::try_from(content_rows.saturating_sub(self.detail_viewport)).unwrap_or(u16::MAX);
+        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
     }
 
     /// Maps a terminal key event into a state transition and optional I/O action.
@@ -1034,7 +1039,8 @@ impl App {
             self.detail_scroll.saturating_sub(distance)
         } else {
             self.detail_scroll.saturating_add(distance)
-        };
+        }
+        .min(self.detail_max_scroll);
     }
 
     fn focus_secondary_panel(&mut self) {
@@ -1349,7 +1355,7 @@ mod tests {
         assert_eq!(app.selected_item().map(|item| item.id), Some(8));
 
         app.set_focus(FocusPane::Detail);
-        app.set_detail_viewport(7);
+        app.set_detail_metrics(7, usize::MAX);
         app.detail_scroll = u16::MAX - 2;
         let _ = app.handle_key(key(KeyCode::PageDown));
         assert_eq!(app.detail_scroll(), u16::MAX);
@@ -1362,7 +1368,7 @@ mod tests {
     fn detail_paging_uses_its_actual_viewport() {
         let mut app = App::new(page());
         app.set_focus(FocusPane::Detail);
-        app.set_detail_viewport(7);
+        app.set_detail_metrics(7, 30);
 
         let _ = app.handle_key(key(KeyCode::PageDown));
         assert_eq!(app.detail_scroll(), 7);
