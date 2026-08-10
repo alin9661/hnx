@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["hacker-news", "terminal", "ratatui", "tui", "cli"]
 categories = ["command-line-utilities"]
 
+[[bin]]
+name = "hnx"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
