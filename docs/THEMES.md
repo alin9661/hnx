@@ -26,4 +26,6 @@ error = "#b42318"
 
 Unknown roles and invalid colors reject the custom file; startup continues
 with `classic` and reports the reason. Setting `NO_COLOR` selects a style-only
-mapping with no color escape sequences.
+mapping that assigns no palette colors: every role resolves to the terminal's
+own default foreground and background, leaving only modifiers such as bold and
+underline to carry emphasis.

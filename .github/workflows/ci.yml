@@ -66,6 +66,13 @@ jobs:
   security:
     name: Dependency policy
     runs-on: ubuntu-latest
+    # rustsec/audit-check reports advisories through the Checks API. The
+    # workflow-level `permissions` block zeroes every unlisted scope, so
+    # without `checks: write` the action fails with "Resource not accessible
+    # by integration" instead of annotating the run.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v6
         with:
