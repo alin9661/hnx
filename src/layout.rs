@@ -76,6 +76,10 @@ impl Default for LayoutPreferences {
 
 impl LayoutPreferences {
     /// Checks ratios and breakpoint ordering atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for ratios below 15%, totals other than 100, or invalid breakpoints.
     pub fn validate(self) -> Result<Self, LayoutError> {
         validate_ratios("two", &self.two)?;
         validate_ratios("three", &self.three)?;
@@ -98,6 +102,10 @@ impl LayoutPreferences {
     }
 
     /// Resizes the focused pane by percentage points while retaining a 15% minimum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either pane adjacent to the divider would fall below 15%.
     pub fn resized(&self, focus: FocusPane, delta: i8) -> Result<Self, LayoutError> {
         let mode = match self.mode {
             PaneMode::Two => ResolvedMode::Two,
@@ -107,6 +115,10 @@ impl LayoutPreferences {
     }
 
     /// Resizes the divider in the currently resolved layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a one-pane layout or an adjustment that violates the minimum.
     pub fn resized_for(
         &self,
         mode: ResolvedMode,

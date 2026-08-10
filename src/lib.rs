@@ -5,6 +5,7 @@ pub mod app;
 pub mod article;
 pub mod cache;
 pub mod cli;
+pub mod config;
 pub mod layout;
 pub mod model;
 pub mod sanitize;
