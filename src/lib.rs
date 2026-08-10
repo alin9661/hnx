@@ -7,6 +7,7 @@ pub mod cache;
 pub mod model;
 pub mod sanitize;
 pub mod theme;
+pub mod ui;
 
 pub use api::{ApiError, DataSource, HybridClient, SearchType};
 pub use cache::Cache;
