@@ -797,12 +797,15 @@ mod tests {
 
     #[test]
     fn narrow_layout_renders_only_the_focused_pane() {
-        let narrow = layout_for(
-            Rect::new(0, 0, 79, 30),
-            FocusPane::Thread,
-            SecondaryPane::Detail,
-        );
-        assert!(narrow.stories.is_none() && narrow.thread.is_some() && narrow.detail.is_none());
+        let area = Rect::new(0, 0, 79, 30);
+        let stories = layout_for(area, FocusPane::Stories, SecondaryPane::Thread);
+        assert!(stories.stories.is_some() && stories.thread.is_none() && stories.detail.is_none());
+
+        let thread = layout_for(area, FocusPane::Thread, SecondaryPane::Detail);
+        assert!(thread.stories.is_none() && thread.thread.is_some() && thread.detail.is_none());
+
+        let detail = layout_for(area, FocusPane::Detail, SecondaryPane::Thread);
+        assert!(detail.stories.is_none() && detail.thread.is_none() && detail.detail.is_some());
     }
 
     #[test]
@@ -848,11 +851,11 @@ mod tests {
 
     #[test]
     fn every_responsive_boundary_renders_the_expected_mode() {
-        for (width, expected_mode) in [
-            (120, "2-pane"),
-            (119, "2-pane"),
-            (80, "2-pane"),
-            (79, "1-pane"),
+        for (width, expected_mode, expects_tab_hint) in [
+            (120, "2-pane", true),
+            (119, "2-pane", true),
+            (80, "2-pane", true),
+            (79, "1-pane", false),
         ] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -874,6 +877,65 @@ mod tests {
             );
             assert!(rendered.contains("? help"));
             assert!(rendered.contains("q quit"));
+            assert!(rendered.contains("Ctrl+U/D half-page"));
+            assert!(rendered.contains("PgUp/PgDn page"));
+            assert_eq!(rendered.contains("Tab pane"), expects_tab_hint);
         }
+    }
+
+    #[test]
+    fn render_applies_brand_selection_and_sets_the_detail_viewport() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.set_focus(FocusPane::Detail);
+        let theme = Theme::classic();
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("detail frame renders");
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.fg == theme.selected_fg && cell.bg == theme.selected_bg })
+        );
+        let rendered = buffer
+            .content()
+            .iter()
+            .fold(String::new(), |mut output, cell| {
+                output.push_str(cell.symbol());
+                output
+            });
+        assert!(rendered.contains("Ctrl+U/D half-page"));
+        assert!(rendered.contains("PgUp/PgDn page"));
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.detail_scroll(), 17);
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("help frame renders");
+        let help =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(help.contains("Ctrl+U/D"));
+        assert!(help.contains("PgUp/PgDn"));
     }
 }

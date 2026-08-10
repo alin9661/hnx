@@ -1423,6 +1423,44 @@ mod tests {
         assert_eq!(app.focus(), FocusPane::Detail);
         let _ = app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.focus(), FocusPane::Stories);
+
+        let _ = app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.focus(), FocusPane::Thread);
+        assert_eq!(app.secondary_pane(), super::SecondaryPane::Thread);
+    }
+
+    #[test]
+    fn thread_focus_uses_half_and_full_viewport_paging() {
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: (10..=17)
+                .map(|id| Comment {
+                    id,
+                    ..Comment::default()
+                })
+                .collect(),
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 43,
+        });
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(13));
+
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(17));
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(14));
+
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(10));
     }
 
     #[test]
