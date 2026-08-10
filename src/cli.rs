@@ -376,7 +376,8 @@ fn apply_requested_layout(
     layout_override: Option<&LayoutOverride>,
 ) -> Result<Option<String>, CliError> {
     let (layout, warning) = resolve_cached_layout(cache, config_path, layout_override)?;
-    Ok(warning.or_else(|| persist_startup_layout(cache, &layout)))
+    let persistence_warning = persist_startup_layout(cache, &layout);
+    Ok(warning.or(persistence_warning))
 }
 
 async fn run_feed(
@@ -1080,8 +1081,9 @@ async fn run_tui(
     layout_override: Option<&LayoutOverride>,
 ) -> Result<(), CliError> {
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
-    let (layout, mut layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
-    layout_warning = layout_warning.or_else(|| persist_startup_layout(&cache, &layout));
+    let (layout, layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
+    let persistence_warning = persist_startup_layout(&cache, &layout);
+    let layout_warning = layout_warning.or(persistence_warning);
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
@@ -1733,6 +1735,31 @@ mod tests {
                 .get_setting(LAYOUT_SETTING_KEY)
                 .expect("setting reads"),
             None
+        );
+    }
+
+    #[test]
+    fn layout_override_replaces_corrupt_stored_state_despite_warning() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        cache
+            .set_setting(LAYOUT_SETTING_KEY, "{broken")
+            .expect("corrupt setting writes");
+        let apply = "three:40,30"
+            .parse::<crate::config::LayoutOverride>()
+            .expect("layout parses");
+
+        assert!(
+            apply_requested_layout(&cache, None, Some(&apply))
+                .expect("layout applies")
+                .is_some()
+        );
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("replacement reads")
+                .expect("replacement saved")
+                .three,
+            [40, 30, 30]
         );
     }
 
