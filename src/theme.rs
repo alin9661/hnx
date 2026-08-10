@@ -86,7 +86,7 @@ impl Theme {
             foreground: Color::Rgb(0, 0, 0),
             muted: Color::Rgb(112, 112, 106),
             accent: Color::Rgb(255, 102, 0),
-            accent_fg: Color::Black,
+            accent_fg: Color::Rgb(0, 0, 0),
             highlight: Color::Rgb(196, 72, 0),
             success: Color::Rgb(26, 127, 55),
             warning: Color::Rgb(158, 92, 0),
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(classic.background, Color::Rgb(247, 246, 240));
         assert_eq!(classic.foreground, Color::Rgb(0, 0, 0));
         assert_eq!(classic.accent, Color::Rgb(255, 102, 0));
-        assert_eq!(classic.accent_fg, Color::Black);
+        assert_eq!(classic.accent_fg, Color::Rgb(0, 0, 0));
         assert_eq!(classic.highlight, Color::Rgb(196, 72, 0));
         assert_eq!(classic.selected_fg, Color::Rgb(0, 0, 0));
         assert_eq!(classic.selected_bg, Color::Rgb(229, 228, 222));
