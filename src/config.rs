@@ -224,3 +224,127 @@ pub enum ConfigError {
     #[error("saved layout JSON is invalid: {0}")]
     StoredJson(serde_json::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    fn config(contents: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("temp config");
+        file.write_all(contents.as_bytes()).expect("write config");
+        file
+    }
+
+    #[test]
+    fn cli_syntax_parses_modes_ratios_and_reset() {
+        assert_eq!("reset".parse(), Ok(LayoutOverride::Reset));
+        assert_eq!(
+            "two:40".parse(),
+            Ok(LayoutOverride::Apply {
+                mode: PaneMode::Two,
+                ratios: Some(vec![40, 60]),
+            })
+        );
+        assert_eq!(
+            "three:35,30".parse(),
+            Ok(LayoutOverride::Apply {
+                mode: PaneMode::Three,
+                ratios: Some(vec![35, 30, 35]),
+            })
+        );
+        assert!("two:10".parse::<LayoutOverride>().is_err());
+        assert!("three:40".parse::<LayoutOverride>().is_err());
+        assert!("three:60,50".parse::<LayoutOverride>().is_err());
+    }
+
+    #[test]
+    fn precedence_is_cli_then_stored_then_toml_then_defaults() {
+        let file = config(
+            "[layout]\nmode = 'three'\ntwo = [40, 60]\nthree = [34, 33, 33]\ntwo_min_width = 70\nthree_min_width = 100\n",
+        );
+        let stored = LayoutPreferences {
+            mode: PaneMode::Two,
+            two: [45, 55],
+            ..LayoutPreferences::default()
+        };
+        let stored_json = serde_json::to_string(&stored).expect("stored JSON");
+
+        let toml_only = resolve_layout(Some(file.path()), None, None).expect("TOML resolves");
+        assert_eq!(toml_only.active.mode, PaneMode::Three);
+        assert_eq!(toml_only.active.two, [40, 60]);
+
+        let stored_result =
+            resolve_layout(Some(file.path()), Some(&stored_json), None).expect("stored resolves");
+        assert_eq!(stored_result.active, stored);
+        assert_eq!(stored_result.baseline.two, [40, 60]);
+
+        let cli = "three:38,32".parse::<LayoutOverride>().expect("CLI parses");
+        let cli_result = resolve_layout(Some(file.path()), Some(&stored_json), Some(&cli))
+            .expect("CLI resolves");
+        assert_eq!(cli_result.active.mode, PaneMode::Three);
+        assert_eq!(cli_result.active.three, [38, 32, 30]);
+        assert_eq!(cli_result.active.two, [45, 55]);
+        assert!(cli_result.persist_cli);
+    }
+
+    #[test]
+    fn reset_ignores_stored_state_and_restores_toml() {
+        let file = config("[layout]\nmode = 'three'\ntwo = [42, 58]\n");
+        let stored = serde_json::to_string(&LayoutPreferences {
+            two: [50, 50],
+            ..LayoutPreferences::default()
+        })
+        .expect("stored JSON");
+        let result = resolve_layout(
+            Some(file.path()),
+            Some(&stored),
+            Some(&LayoutOverride::Reset),
+        )
+        .expect("reset resolves");
+        assert_eq!(result.active.two, [42, 58]);
+        assert!(result.reset_saved);
+        assert!(!result.persist_cli);
+    }
+
+    #[test]
+    fn corrupt_stored_state_falls_back_atomically_with_one_warning() {
+        let file = config("[layout]\ntwo = [40, 60]\n");
+        let result = resolve_layout(Some(file.path()), Some("{broken"), None)
+            .expect("stored corruption is recoverable");
+        assert_eq!(result.active.two, [40, 60]);
+        assert_eq!(
+            result.warning.as_deref(),
+            Some("Saved layout was invalid; using config or built-in defaults")
+        );
+
+        let invalid = serde_json::json!({
+            "mode": "two",
+            "two": [90, 10],
+            "three": [38, 34, 28],
+            "two_min_width": 80,
+            "three_min_width": 120
+        });
+        let result = resolve_layout(Some(file.path()), Some(&invalid.to_string()), None)
+            .expect("stored validation failure is recoverable");
+        assert_eq!(result.active.two, [40, 60]);
+        assert!(result.warning.is_some());
+    }
+
+    #[test]
+    fn explicit_config_errors_are_fatal() {
+        let missing = Path::new("/definitely/missing/hnx-config.toml");
+        assert!(matches!(
+            resolve_layout(Some(missing), None, None),
+            Err(ConfigError::Read { .. })
+        ));
+        let invalid = config("[layout]\ntwo = [10, 90]\n");
+        assert!(matches!(
+            resolve_layout(Some(invalid.path()), None, None),
+            Err(ConfigError::Layout(_))
+        ));
+    }
+}
