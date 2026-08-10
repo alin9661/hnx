@@ -180,15 +180,19 @@ fn load_baseline(
     let Some(path) = default_config_path() else {
         return Ok((LayoutPreferences::default(), None));
     };
+    Ok(load_discovered_baseline(&path))
+}
+
+fn load_discovered_baseline(path: &Path) -> (LayoutPreferences, Option<String>) {
     if !path.exists() {
-        return Ok((LayoutPreferences::default(), None));
+        return (LayoutPreferences::default(), None);
     }
-    match read_config(&path) {
-        Ok(preferences) => Ok((preferences, None)),
-        Err(_) => Ok((
+    match read_config(path) {
+        Ok(preferences) => (preferences, None),
+        Err(_) => (
             LayoutPreferences::default(),
             Some("Invalid auto-discovered layout config; using built-in defaults".to_owned()),
-        )),
+        ),
     }
 }
 
@@ -241,7 +245,7 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::{fs, io::Write as _};
 
     use tempfile::NamedTempFile;
 
@@ -377,5 +381,27 @@ mod tests {
             resolve_layout(Some(invalid.path()), None, None),
             Err(ConfigError::Layout(_))
         ));
+    }
+
+    #[test]
+    fn discovered_config_is_silent_when_missing_and_warns_once_when_corrupt() {
+        let directory = tempfile::tempdir().expect("temp config directory");
+        let path = directory.path().join("config.toml");
+        let (missing, warning) = load_discovered_baseline(&path);
+        assert_eq!(missing, LayoutPreferences::default());
+        assert!(warning.is_none());
+
+        fs::write(&path, "[layout]\ntwo = [40, 60]\n").expect("write valid config");
+        let (valid, warning) = load_discovered_baseline(&path);
+        assert_eq!(valid.two, [40, 60]);
+        assert!(warning.is_none());
+
+        fs::write(&path, "[layout]\ntwo = [10, 90]\n").expect("write invalid config");
+        let (fallback, warning) = load_discovered_baseline(&path);
+        assert_eq!(fallback, LayoutPreferences::default());
+        assert_eq!(
+            warning.as_deref(),
+            Some("Invalid auto-discovered layout config; using built-in defaults")
+        );
     }
 }

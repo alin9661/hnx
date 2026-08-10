@@ -6,10 +6,54 @@ use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::app::{FocusPane, SecondaryPane};
-
 pub const MIN_PANE_PERCENT: u8 = 15;
 pub const MIN_PANE_COLUMNS: u16 = 18;
+
+/// The content pane that receives navigation input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusPane {
+    #[default]
+    Stories,
+    Thread,
+    Detail,
+}
+
+impl FocusPane {
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Stories => Self::Thread,
+            Self::Thread => Self::Detail,
+            Self::Detail => Self::Stories,
+        }
+    }
+
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Stories => Self::Detail,
+            Self::Thread => Self::Stories,
+            Self::Detail => Self::Thread,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stories => "stories",
+            Self::Thread => "thread",
+            Self::Detail => "detail",
+        }
+    }
+}
+
+/// Which secondary pane remains visible beside stories in the two-pane layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondaryPane {
+    #[default]
+    Thread,
+    Detail,
+}
 
 /// The pane arrangement requested by the user.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

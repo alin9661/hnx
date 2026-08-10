@@ -10,51 +10,7 @@ use crate::{
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
 };
 
-/// The content pane that receives navigation input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FocusPane {
-    #[default]
-    Stories,
-    Thread,
-    Detail,
-}
-
-impl FocusPane {
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Stories => Self::Thread,
-            Self::Thread => Self::Detail,
-            Self::Detail => Self::Stories,
-        }
-    }
-
-    #[must_use]
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::Stories => Self::Detail,
-            Self::Thread => Self::Stories,
-            Self::Detail => Self::Thread,
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Stories => "stories",
-            Self::Thread => "thread",
-            Self::Detail => "detail",
-        }
-    }
-}
-
-/// Which secondary pane remains visible beside stories in the two-pane layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SecondaryPane {
-    #[default]
-    Thread,
-    Detail,
-}
+pub use crate::layout::{FocusPane, SecondaryPane};
 
 /// The active text prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1619,6 +1575,24 @@ mod tests {
         assert!(
             app.status()
                 .is_some_and(|status| status.contains("rejected"))
+        );
+    }
+
+    #[test]
+    fn one_pane_resize_is_nonfatal_and_preserves_preferences() {
+        let mut app = App::new(page());
+        let preferences = app.layout_preferences().clone();
+        app.set_rendered_panes(
+            crate::layout::PaneSet::one(FocusPane::Stories),
+            crate::layout::ResolvedMode::One,
+        );
+
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('h'))), AppAction::None);
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('l'))), AppAction::None);
+        assert_eq!(app.layout_preferences(), &preferences);
+        assert_eq!(
+            app.status(),
+            Some("pane resizing is unavailable while only one pane is visible")
         );
     }
 

@@ -36,7 +36,7 @@ use crate::{
     app::{App, AppAction, ArticleView},
     article::{Article as FetchedArticle, ArticleClient},
     cache::{Cache, CacheEntry, CacheError},
-    config::{LayoutOverride, resolve_layout},
+    config::{LayoutOverride, LayoutResolution, resolve_layout},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
     sanitize::{sanitize_single_line, sanitize_text, validate_url},
     theme::Theme,
@@ -51,6 +51,7 @@ const FEED_TTL: Duration = Duration::from_secs(5 * 60);
 const ITEM_TTL: Duration = Duration::from_secs(60 * 60);
 const THREAD_TTL: Duration = Duration::from_secs(15 * 60);
 const SEARCH_TTL: Duration = Duration::from_secs(5 * 60);
+const LAYOUT_SETTING_KEY: &str = "layout.v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -242,6 +243,14 @@ pub async fn run() -> Result<(), CliError> {
         .as_ref()
         .map_or_else(Cache::open_default, Cache::open_in_dir)?;
 
+    if cli.command.is_some()
+        && cli.layout.is_some()
+        && let Some(warning) =
+            apply_requested_layout(&cache, cli.config.as_deref(), cli.layout.as_ref())?
+    {
+        warn_stderr(format_args!("{}", sanitize_single_line(&warning)));
+    }
+
     match cli.command {
         None => {
             run_tui(
@@ -314,6 +323,60 @@ pub async fn run() -> Result<(), CliError> {
         }
         Some(Command::Cache { command }) => run_cache_command(&cache, command),
     }
+}
+
+fn resolve_cached_layout(
+    cache: &Cache,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
+) -> Result<(LayoutResolution, Option<String>), CliError> {
+    let (stored_layout, stored_read_warning) = match cache.get_setting(LAYOUT_SETTING_KEY) {
+        Ok(value) => (value, None),
+        Err(_) => (
+            None,
+            Some("Could not read saved layout; using config or built-in defaults".to_owned()),
+        ),
+    };
+    let layout = resolve_layout(config_path, stored_layout.as_deref(), layout_override)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+    let warning = stored_read_warning.or(layout.warning.clone());
+    Ok((layout, warning))
+}
+
+fn persist_layout_action(cache: &Cache, action: &AppAction) -> Result<(), CacheError> {
+    match action {
+        AppAction::LayoutChanged(layout) => cache.set_json_setting(LAYOUT_SETTING_KEY, layout),
+        AppAction::LayoutReset => cache.remove_setting(LAYOUT_SETTING_KEY).map(drop),
+        _ => Ok(()),
+    }
+}
+
+fn persist_startup_layout(cache: &Cache, layout: &LayoutResolution) -> Option<String> {
+    let (action, failure) = if layout.reset_saved {
+        (
+            AppAction::LayoutReset,
+            "Layout reset, but the saved override could not be removed",
+        )
+    } else if layout.persist_cli {
+        (
+            AppAction::LayoutChanged(layout.active.clone()),
+            "Layout applied, but the preference could not be saved",
+        )
+    } else {
+        return None;
+    };
+    persist_layout_action(cache, &action)
+        .err()
+        .map(|_| failure.to_owned())
+}
+
+fn apply_requested_layout(
+    cache: &Cache,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
+) -> Result<Option<String>, CliError> {
+    let (layout, warning) = resolve_cached_layout(cache, config_path, layout_override)?;
+    Ok(warning.or_else(|| persist_startup_layout(cache, &layout)))
 }
 
 async fn run_feed(
@@ -1017,27 +1080,8 @@ async fn run_tui(
     layout_override: Option<&LayoutOverride>,
 ) -> Result<(), CliError> {
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
-    let (stored_layout, stored_read_warning) = match cache.get_setting("layout.v1") {
-        Ok(value) => (value, None),
-        Err(_) => (
-            None,
-            Some("Could not read saved layout; using config or built-in defaults".to_owned()),
-        ),
-    };
-    let layout = resolve_layout(config_path, stored_layout.as_deref(), layout_override)
-        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
-    let mut layout_warning = stored_read_warning.or(layout.warning.clone());
-    if layout.reset_saved {
-        if cache.remove_setting("layout.v1").is_err() {
-            layout_warning.get_or_insert_with(|| {
-                "Layout reset, but the saved override could not be removed".to_owned()
-            });
-        }
-    } else if layout.persist_cli && cache.set_json_setting("layout.v1", &layout.active).is_err() {
-        layout_warning.get_or_insert_with(|| {
-            "Layout applied, but the preference could not be saved".to_owned()
-        });
-    }
+    let (layout, mut layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
+    layout_warning = layout_warning.or_else(|| persist_startup_layout(&cache, &layout));
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
@@ -1286,12 +1330,13 @@ async fn run_tui(
                                     }
                                 }
                                 AppAction::LayoutChanged(layout) => {
-                                    if let Err(error) = cache.set_json_setting("layout.v1", &layout) {
+                                    let action = AppAction::LayoutChanged(layout);
+                                    if let Err(error) = persist_layout_action(&cache, &action) {
                                         app.set_status(format!("Layout changed but was not saved: {error}"));
                                     }
                                 }
                                 AppAction::LayoutReset => {
-                                    if let Err(error) = cache.remove_setting("layout.v1") {
+                                    if let Err(error) = persist_layout_action(&cache, &AppAction::LayoutReset) {
                                         app.set_status(format!("Layout reset but saved override remains: {error}"));
                                     }
                                 }
@@ -1574,13 +1619,16 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        CleanupGuard, Cli, CliError, Command, OutputFormat, PageContext, cleanup_once,
-        handle_open_story, next_request_id, parse_item_id, parse_limit, parse_search_query,
-        write_buffered, write_comments, write_item, write_json, write_page, write_thread,
+        CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
+        apply_requested_layout, cleanup_once, handle_open_story, next_request_id, parse_item_id,
+        parse_limit, parse_search_query, persist_layout_action, write_buffered, write_comments,
+        write_item, write_json, write_page, write_thread,
     };
     use crate::{
         api::SearchType,
-        app::App,
+        app::{App, AppAction},
+        cache::Cache,
+        layout::{LayoutPreferences, PaneMode},
         model::{Comment, Feed, Item, Source, StoryPage, Thread},
     };
 
@@ -1633,6 +1681,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn layout_actions_round_trip_through_sqlite() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let preferences = LayoutPreferences::default().with_mode(PaneMode::Three);
+
+        persist_layout_action(&cache, &AppAction::LayoutChanged(preferences.clone()))
+            .expect("layout persists");
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("layout reads"),
+            Some(preferences)
+        );
+
+        persist_layout_action(&cache, &AppAction::LayoutReset).expect("layout resets");
+        assert_eq!(
+            cache
+                .get_setting(LAYOUT_SETTING_KEY)
+                .expect("setting reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn headless_layout_requests_apply_to_sqlite() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let apply = "three:40,30"
+            .parse::<crate::config::LayoutOverride>()
+            .expect("layout parses");
+        assert!(
+            apply_requested_layout(&cache, None, Some(&apply))
+                .expect("layout applies")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("layout reads")
+                .expect("layout saved")
+                .three,
+            [40, 30, 30]
+        );
+
+        apply_requested_layout(&cache, None, Some(&crate::config::LayoutOverride::Reset))
+            .expect("reset applies");
+        assert_eq!(
+            cache
+                .get_setting(LAYOUT_SETTING_KEY)
+                .expect("setting reads"),
+            None
+        );
     }
 
     #[test]
