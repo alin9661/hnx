@@ -33,9 +33,23 @@ impl LayoutOverride {
         };
         let mut preferences = baseline.clone().with_mode(*mode);
         if let Some(ratios) = ratios {
-            match mode {
-                PaneMode::Two => preferences.two = [ratios[0], ratios[1]],
-                PaneMode::Three => preferences.three = [ratios[0], ratios[1], ratios[2]],
+            match (mode, ratios.as_slice()) {
+                (PaneMode::Two, [stories, secondary]) => {
+                    preferences.two = [*stories, *secondary];
+                }
+                (PaneMode::Three, [stories, thread, detail]) => {
+                    preferences.three = [*stories, *thread, *detail];
+                }
+                (mode, ratios) => {
+                    return Err(LayoutError::OverrideArity {
+                        mode: *mode,
+                        expected: match mode {
+                            PaneMode::Two => 2,
+                            PaneMode::Three => 3,
+                        },
+                        actual: ratios.len(),
+                    });
+                }
             }
         }
         preferences.validate()
@@ -259,6 +273,23 @@ mod tests {
         assert!("two:10".parse::<LayoutOverride>().is_err());
         assert!("three:40".parse::<LayoutOverride>().is_err());
         assert!("three:60,50".parse::<LayoutOverride>().is_err());
+    }
+
+    #[test]
+    fn programmatic_override_rejects_bad_arity_without_panicking() {
+        let override_ = LayoutOverride::Apply {
+            mode: PaneMode::Three,
+            ratios: Some(vec![50]),
+        };
+
+        assert!(matches!(
+            override_.apply(&LayoutPreferences::default()),
+            Err(LayoutError::OverrideArity {
+                mode: PaneMode::Three,
+                expected: 3,
+                actual: 1
+            })
+        ));
     }
 
     #[test]

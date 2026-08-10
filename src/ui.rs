@@ -1055,7 +1055,8 @@ mod tests {
         app.configure_layout(
             LayoutPreferences::default().with_mode(PaneMode::Three),
             LayoutPreferences::default(),
-        );
+        )
+        .expect("layout validates");
         app.load_thread(Thread {
             item: Item {
                 id: 1,

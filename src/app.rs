@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use regex::RegexBuilder;
 
 use crate::{
-    layout::{LayoutPreferences, PaneSet, ResolvedMode},
+    layout::{LayoutError, LayoutPreferences, PaneSet, ResolvedMode},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
 };
 
@@ -713,11 +713,20 @@ impl App {
     }
 
     /// Installs validated active preferences and the TOML/built-in reset baseline.
-    pub fn configure_layout(&mut self, active: LayoutPreferences, baseline: LayoutPreferences) {
-        debug_assert!(active.clone().validate().is_ok());
-        debug_assert!(baseline.clone().validate().is_ok());
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing either value when one preference set is invalid.
+    pub fn configure_layout(
+        &mut self,
+        active: LayoutPreferences,
+        baseline: LayoutPreferences,
+    ) -> Result<(), LayoutError> {
+        let active = active.validate()?;
+        let baseline = baseline.validate()?;
         self.layout = active;
         self.layout_baseline = baseline;
+        Ok(())
     }
 
     /// Records which panes the latest frame actually rendered.
@@ -1563,7 +1572,8 @@ mod tests {
     fn layout_toggle_resize_and_reset_emit_persistence_actions() {
         let mut app = App::new(page());
         let baseline = crate::layout::LayoutPreferences::default();
-        app.configure_layout(baseline.clone(), baseline.clone());
+        app.configure_layout(baseline.clone(), baseline.clone())
+            .expect("layout validates");
 
         let action = app.handle_key(key(KeyCode::Char('L')));
         assert!(matches!(action, AppAction::LayoutChanged(_)));
@@ -1597,7 +1607,8 @@ mod tests {
         app.configure_layout(
             preferences.clone(),
             crate::layout::LayoutPreferences::default(),
-        );
+        )
+        .expect("layout validates");
         app.set_rendered_panes(
             crate::layout::PaneSet::two(super::SecondaryPane::Thread),
             crate::layout::ResolvedMode::Two,
@@ -1609,6 +1620,77 @@ mod tests {
             app.status()
                 .is_some_and(|status| status.contains("rejected"))
         );
+    }
+
+    #[test]
+    fn invalid_layout_configuration_is_rejected_atomically() {
+        let mut app = App::new(page());
+        let original = app.layout_preferences().clone();
+        let active = crate::layout::LayoutPreferences {
+            mode: crate::layout::PaneMode::Three,
+            ..original.clone()
+        };
+        let invalid_baseline = crate::layout::LayoutPreferences {
+            two: [90, 10],
+            ..original.clone()
+        };
+
+        assert!(app.configure_layout(active, invalid_baseline).is_err());
+        assert_eq!(app.layout_preferences(), &original);
+    }
+
+    #[test]
+    fn layout_changes_preserve_loaded_reading_state() {
+        let mut app = App::new(page());
+        app.set_viewports(3, 2);
+        for _ in 0..5 {
+            let _ = app.handle_key(key(KeyCode::Down));
+        }
+        app.load_thread(Thread {
+            item: app.selected_item().cloned().expect("story selected"),
+            comments: vec![Comment {
+                id: 10,
+                children: vec![Comment {
+                    id: 11,
+                    ..Comment::default()
+                }],
+                ..Comment::default()
+            }],
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 43,
+        });
+        let _ = app.handle_key(key(KeyCode::Enter));
+        app.set_article(super::ArticleView::new(
+            "Article",
+            Some("https://example.com/article".to_owned()),
+            "one\ntwo\nthree\nfour\nfive\nsix",
+        ));
+        app.set_detail_metrics(2, 6);
+        let _ = app.handle_key(key(KeyCode::PageDown));
+
+        let story_id = app.selected_item().map(|item| item.id);
+        let story_offset = app.story_offset();
+        let comment_id = app.selected_comment().map(|comment| comment.id);
+        let comment_offset = app.comment_offset();
+        let article = app.article().cloned();
+        let detail_scroll = app.detail_scroll();
+
+        let _ = app.handle_key(key(KeyCode::Char('L')));
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+        let _ = app.handle_key(alt_key(KeyCode::Char('l')));
+
+        assert_eq!(app.selected_item().map(|item| item.id), story_id);
+        assert_eq!(app.story_offset(), story_offset);
+        assert_eq!(app.selected_comment().map(|comment| comment.id), comment_id);
+        assert_eq!(app.comment_offset(), comment_offset);
+        assert!(app.is_comment_collapsed(10));
+        assert_eq!(app.article(), article.as_ref());
+        assert_eq!(app.detail_scroll(), detail_scroll);
+        assert_eq!(app.focus(), FocusPane::Detail);
     }
 
     #[test]

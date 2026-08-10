@@ -232,6 +232,11 @@ impl<T> Envelope<T> {
 pub async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     init_tracing(cli.log_file.as_ref())?;
+
+    if cli.command.is_some() && cli.config.is_some() {
+        resolve_layout(cli.config.as_deref(), None, cli.layout.as_ref())
+            .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+    }
     let cache = cli
         .cache_dir
         .as_ref()
@@ -1039,7 +1044,8 @@ async fn run_tui(
         || App::empty(Feed::Top),
         |entry| App::new(cache_page(entry, Some(DEFAULT_LIMIT))),
     );
-    app.configure_layout(layout.active, layout.baseline);
+    app.configure_layout(layout.active, layout.baseline)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
     app.set_bookmarks(cache.bookmarks()?.into_iter().map(|item| item.id));
     if offline {
         app.set_offline(true);

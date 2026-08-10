@@ -65,7 +65,8 @@ fn render_large_thread(c: &mut Criterion) {
             app.configure_layout(
                 LayoutPreferences::default().with_mode(mode),
                 LayoutPreferences::default(),
-            );
+            )
+            .expect("benchmark layout validates");
             let theme = Theme::classic();
             let mut move_up = true;
 

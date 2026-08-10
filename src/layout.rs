@@ -321,6 +321,12 @@ pub enum LayoutError {
     RatioTotal { name: &'static str, total: u16 },
     #[error("layout `{name}` ratios must each be at least {minimum}%")]
     RatioTooSmall { name: &'static str, minimum: u8 },
+    #[error("layout `{mode}` override requires {expected} ratios, got {actual}")]
+    OverrideArity {
+        mode: PaneMode,
+        expected: usize,
+        actual: usize,
+    },
     #[error("layout breakpoint `{0}` must be greater than zero")]
     ZeroBreakpoint(&'static str),
     #[error("three_min_width ({three}) must be at least two_min_width ({two})")]
@@ -475,6 +481,14 @@ mod tests {
             }
             .validate(),
             Err(LayoutError::RatioTooSmall { .. })
+        ));
+        assert!(matches!(
+            LayoutPreferences {
+                two_min_width: 0,
+                ..LayoutPreferences::default()
+            }
+            .validate(),
+            Err(LayoutError::ZeroBreakpoint("two_min_width"))
         ));
         assert!(matches!(
             LayoutPreferences {
