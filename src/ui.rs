@@ -12,43 +12,18 @@ use ratatui::{
 
 use crate::{
     app::{App, FocusPane, SecondaryPane},
+    layout::{LayoutPreferences, PaneSet, ResolvedMode, resolve_panes},
     model::{Comment, Feed, Item},
     sanitize::{sanitize_single_line, sanitize_text},
     theme::Theme,
 };
 
-pub const WIDE_MIN_WIDTH: u16 = 120;
-pub const MEDIUM_MIN_WIDTH: u16 = 80;
-
-/// The responsive content arrangement selected for a terminal width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutMode {
-    /// Story list and the active secondary pane at the wide breakpoint.
-    Wide,
-    /// Story list and the active secondary pane.
-    Medium,
-    /// Only the focused pane.
-    Narrow,
-}
-
-impl LayoutMode {
-    #[must_use]
-    pub const fn for_width(width: u16) -> Self {
-        if width >= WIDE_MIN_WIDTH {
-            Self::Wide
-        } else if width >= MEDIUM_MIN_WIDTH {
-            Self::Medium
-        } else {
-            Self::Narrow
-        }
-    }
-}
-
 /// Rectangles used by the renderer. `None` means that pane is hidden at this width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiLayout {
-    pub mode: LayoutMode,
-    pub tabs: Rect,
+    pub mode: ResolvedMode,
+    pub panes: PaneSet,
+    pub masthead: Rect,
     pub stories: Option<Rect>,
     pub thread: Option<Rect>,
     pub detail: Option<Rect>,
@@ -57,14 +32,18 @@ pub struct UiLayout {
 
 /// Computes all UI regions without rendering or mutating application state.
 #[must_use]
-pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiLayout {
-    let mode = LayoutMode::for_width(area.width);
-    let header_height = area.height.min(3);
+pub fn layout_for(
+    area: Rect,
+    preferences: &LayoutPreferences,
+    focus: FocusPane,
+    secondary: SecondaryPane,
+) -> UiLayout {
+    let header_height = area.height.min(1);
     let remaining = area.height.saturating_sub(header_height);
-    let status_height = remaining.min(2);
+    let status_height = remaining.min(1);
     let content_height = remaining.saturating_sub(status_height);
 
-    let tabs = Rect::new(area.x, area.y, area.width, header_height);
+    let masthead = Rect::new(area.x, area.y, area.width, header_height);
     let content = Rect::new(
         area.x,
         area.y.saturating_add(header_height),
@@ -80,27 +59,15 @@ pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiL
         status_height,
     );
 
-    let (stories, thread, detail) = match mode {
-        LayoutMode::Wide | LayoutMode::Medium => {
-            let [stories, secondary_area] = split_two(content, 44);
-            match secondary {
-                SecondaryPane::Thread => (Some(stories), Some(secondary_area), None),
-                SecondaryPane::Detail => (Some(stories), None, Some(secondary_area)),
-            }
-        }
-        LayoutMode::Narrow => match focus {
-            FocusPane::Stories => (Some(content), None, None),
-            FocusPane::Thread => (None, Some(content), None),
-            FocusPane::Detail => (None, None, Some(content)),
-        },
-    };
+    let resolved = resolve_panes(content, preferences, focus, secondary);
 
     UiLayout {
-        mode,
-        tabs,
-        stories,
-        thread,
-        detail,
+        mode: resolved.mode,
+        panes: resolved.panes,
+        masthead,
+        stories: resolved.stories,
+        thread: resolved.thread,
+        detail: resolved.detail,
         status,
     }
 }
@@ -118,7 +85,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
         area,
     );
 
-    let layout = layout_for(area, app.focus(), app.secondary_pane());
+    let layout = layout_for(
+        area,
+        app.layout_preferences(),
+        app.focus(),
+        app.secondary_pane(),
+    );
     let story_rows = layout.stories.map_or(1, |rect| {
         usize::from(rect.height.saturating_sub(2) / 2).max(1)
     });
@@ -126,8 +98,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
         usize::from(rect.height.saturating_sub(2) / 2).max(1)
     });
     app.set_viewports(story_rows, comment_rows);
+    app.set_rendered_panes(layout.panes, layout.mode);
 
-    render_tabs(frame, layout.tabs, app, theme);
+    render_tabs(frame, layout.masthead, app, theme);
     if let Some(rect) = layout.stories {
         render_stories(frame, rect, app, story_rows, theme);
     }
@@ -144,19 +117,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     } else if app.prompt().is_some() {
         render_prompt(frame, area, app, theme);
     }
-}
-
-fn split_two(area: Rect, left_percent: u16) -> [Rect; 2] {
-    let left_width = area.width.saturating_mul(left_percent) / 100;
-    [
-        Rect::new(area.x, area.y, left_width, area.height),
-        Rect::new(
-            area.x.saturating_add(left_width),
-            area.y,
-            area.width.saturating_sub(left_width),
-            area.height,
-        ),
-    ]
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
@@ -491,7 +451,7 @@ fn item_detail(item: &Item, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode, theme: &Theme) {
+fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMode, theme: &Theme) {
     if area.is_empty() {
         return;
     }
@@ -547,17 +507,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode,
     let focus = format!("{} · {}", mode_label(mode), app.focus().label());
     state.push(Span::styled(format!(" {focus} "), theme.muted_style()));
 
-    let mut lines = vec![Line::from(state)];
-    if area.height > 1 {
-        let keys = if area.width >= WIDE_MIN_WIDTH {
-            " ? help  q quit  j/k move  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane  Enter select  a read  o open "
-        } else if area.width >= MEDIUM_MIN_WIDTH {
-            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane "
-        } else {
-            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page "
-        };
-        lines.push(Line::styled(keys, theme.muted_style()));
-    }
+    let lines = vec![Line::from(state)];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -655,10 +605,11 @@ fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
     )
 }
 
-fn mode_label(mode: LayoutMode) -> &'static str {
+fn mode_label(mode: ResolvedMode) -> &'static str {
     match mode {
-        LayoutMode::Wide | LayoutMode::Medium => "2-pane",
-        LayoutMode::Narrow => "1-pane",
+        ResolvedMode::Three => "3-pane",
+        ResolvedMode::Two => "2-pane",
+        ResolvedMode::One => "1-pane",
     }
 }
 
@@ -742,9 +693,10 @@ fn strip_html(input: &str) -> String {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
-    use super::{LayoutMode, centered_rect, layout_for, render};
+    use super::{centered_rect, layout_for, render};
     use crate::{
         app::{App, ArticleView, FocusPane, SecondaryPane},
+        layout::{LayoutPreferences, PaneMode, ResolvedMode},
         model::{Comment, Feed, Item, Source, StoryPage, Thread},
         theme::Theme,
     };
@@ -770,17 +722,36 @@ mod tests {
 
     #[test]
     fn exact_width_breakpoints_choose_expected_layouts() {
-        assert_eq!(LayoutMode::for_width(120), LayoutMode::Wide);
-        assert_eq!(LayoutMode::for_width(119), LayoutMode::Medium);
-        assert_eq!(LayoutMode::for_width(80), LayoutMode::Medium);
-        assert_eq!(LayoutMode::for_width(79), LayoutMode::Narrow);
+        let preferences = LayoutPreferences::default().with_mode(PaneMode::Three);
+        assert_eq!(
+            layout_for(
+                Rect::new(0, 0, 120, 20),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Three
+        );
+        assert_eq!(
+            layout_for(
+                Rect::new(0, 0, 119, 20),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Two
+        );
     }
 
     #[test]
     fn wide_and_medium_render_stories_with_the_active_secondary_pane() {
+        let preferences = LayoutPreferences::default();
         for width in [120, 119, 80] {
             let thread = layout_for(
                 Rect::new(0, 0, width, 30),
+                &preferences,
                 FocusPane::Stories,
                 SecondaryPane::Thread,
             );
@@ -793,6 +764,7 @@ mod tests {
 
             let detail = layout_for(
                 Rect::new(0, 0, width, 30),
+                &preferences,
                 FocusPane::Detail,
                 SecondaryPane::Detail,
             );
@@ -803,13 +775,19 @@ mod tests {
     #[test]
     fn narrow_layout_renders_only_the_focused_pane() {
         let area = Rect::new(0, 0, 79, 30);
-        let stories = layout_for(area, FocusPane::Stories, SecondaryPane::Thread);
+        let preferences = LayoutPreferences::default();
+        let stories = layout_for(
+            area,
+            &preferences,
+            FocusPane::Stories,
+            SecondaryPane::Thread,
+        );
         assert!(stories.stories.is_some() && stories.thread.is_none() && stories.detail.is_none());
 
-        let thread = layout_for(area, FocusPane::Thread, SecondaryPane::Detail);
+        let thread = layout_for(area, &preferences, FocusPane::Thread, SecondaryPane::Detail);
         assert!(thread.stories.is_none() && thread.thread.is_some() && thread.detail.is_none());
 
-        let detail = layout_for(area, FocusPane::Detail, SecondaryPane::Thread);
+        let detail = layout_for(area, &preferences, FocusPane::Detail, SecondaryPane::Thread);
         assert!(detail.stories.is_none() && detail.thread.is_none() && detail.detail.is_some());
     }
 
@@ -957,6 +935,7 @@ mod tests {
 
         let detail = layout_for(
             Rect::new(0, 0, 120, 24),
+            app.layout_preferences(),
             FocusPane::Detail,
             SecondaryPane::Detail,
         )
