@@ -1,7 +1,7 @@
 # hnx
 
 `hnx` is a fast, cache-first Hacker News client for the terminal. Installing
-the crate creates the short `hn` command.
+the crate creates the `hnx` command.
 
 It combines an adaptive Ratatui interface with stable text and JSON commands.
 Cached results render immediately, refresh asynchronously, and remain usable
@@ -41,24 +41,24 @@ cargo install hnx
 Launch the interactive client:
 
 ```bash
-hn
+hnx
 ```
 
 Use the headless interface:
 
 ```bash
-hn feed top --limit 30
-hn feed jobs --format json
-hn item 8863 --comments
-hn search "rust terminal" --type story --format json
-hn hiring rust
-hn freelance design
-hn --offline feed top
-hn cache stats
+hnx feed top --limit 30
+hnx feed jobs --format json
+hnx item 8863 --comments
+hnx search "rust terminal" --type story --format json
+hnx hiring rust
+hnx freelance design
+hnx --offline feed top
+hnx cache stats
 ```
 
 Global options include `--offline`, `--theme <name-or-path>`, and
-`--log-file <path>`. Run `hn --help` for the complete command surface.
+`--log-file <path>`. Run `hnx --help` for the complete command surface.
 
 JSON output has a versioned envelope:
 
@@ -116,16 +116,23 @@ This is an original clean-room implementation informed by the public behavior
 of the projects listed in [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md). No source
 from those projects is included.
 
-The [U.S. Copyright Office](https://www.copyright.gov/help/faq/faq-protect.html)
-states that names and short phrases are not protected by copyright, so a short
-command such as `hn` is not itself a copyright issue. Copyright instead applies
-to original expression such as source code. The upstream project is
+Both the project and its command are named `hnx`. That is deliberate:
+[haxor-news](https://github.com/donnemartin/haxor-news) already installs a `hn`
+command, and shipping a second binary under the same name would collide on
+`PATH` and invite confusion about which project a user is running. `hnx` is
+distinct at every layer — crate name, command name, and repository.
+
+Copyright is not the concern here. The
+[U.S. Copyright Office](https://www.copyright.gov/help/faq/faq-protect.html)
+states that names and short phrases are not protected by copyright; it applies
+to original expression such as source code, and none of that is shared. The
+upstream project is
 [Apache-2.0 licensed](https://github.com/donnemartin/haxor-news/blob/master/LICENSE.txt),
-but [Apache-2.0 section 6](https://www.apache.org/licenses/LICENSE-2.0) does not
-grant general trademark rights. Naming can therefore still raise trademark or
-passing-off questions. The public project name is `hnx`, and it states clearly
-that it is independent and unaffiliated. This is practical U.S.-focused project
-guidance, not legal advice.
+and [Apache-2.0 section 6](https://www.apache.org/licenses/LICENSE-2.0) does not
+grant general trademark rights, so naming can still raise trademark or
+passing-off questions independent of copyright. Using a distinct command name
+and stating clearly that this project is independent and unaffiliated addresses
+both. This is practical U.S.-focused project guidance, not legal advice.
 
 ## License
 
