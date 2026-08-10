@@ -4,6 +4,7 @@ pub mod api;
 pub mod app;
 pub mod article;
 pub mod cache;
+pub mod cli;
 pub mod model;
 pub mod sanitize;
 pub mod theme;
