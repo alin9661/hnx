@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::{
@@ -92,20 +92,28 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
         app.secondary_pane(),
     );
     let story_rows = layout.stories.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(2) / 2).max(1)
+        usize::from(rect.height.saturating_sub(1) / 2).max(1)
     });
     let comment_rows = layout.thread.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(2) / 2).max(1)
+        usize::from(rect.height.saturating_sub(1) / 2).max(1)
     });
     app.set_viewports(story_rows, comment_rows);
     app.set_rendered_panes(layout.panes, layout.mode);
 
     render_tabs(frame, layout.masthead, app, theme);
     if let Some(rect) = layout.stories {
-        render_stories(frame, rect, app, story_rows, theme);
+        let separator = layout.thread.is_some() || layout.detail.is_some();
+        render_stories(frame, rect, app, story_rows, separator, theme);
     }
     if let Some(rect) = layout.thread {
-        render_thread(frame, rect, app, comment_rows, theme);
+        render_thread(
+            frame,
+            rect,
+            app,
+            comment_rows,
+            layout.detail.is_some(),
+            theme,
+        );
     }
     if let Some(rect) = layout.detail {
         render_detail(frame, rect, app, theme);
@@ -127,35 +135,44 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .iter()
         .position(|feed| *feed == app.feed())
         .unwrap_or_default();
-    let titles = Feed::ALL.map(|feed| Line::from(feed.label()));
-    let mut title = vec![Span::styled(
-        " hnx ",
-        Style::default()
-            .fg(theme.accent_fg)
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let masthead_style = Style::default()
+        .fg(theme.accent_fg)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(" Y  hnx ", masthead_style)];
+    for (index, feed) in Feed::ALL.iter().enumerate() {
+        let label = if index == selected {
+            format!(" ◆ {} ", feed.label())
+        } else {
+            format!("   {} ", feed.label())
+        };
+        let style = if index == selected {
+            masthead_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            masthead_style
+        };
+        spans.push(Span::styled(label, style));
+    }
     if let Some(query) = app.search_query() {
-        title.push(Span::styled(
+        spans.push(Span::styled(
             format!(" · “{}” ", sanitize_single_line(query)),
-            theme.muted_style(),
+            masthead_style,
         ));
     }
-    let tabs = Tabs::new(titles)
-        .select(selected)
-        .divider(Span::styled(" │ ", Style::default().fg(theme.border)))
-        .block(
-            Block::default()
-                .title(Line::from(title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border)),
-        )
-        .style(theme.muted_style())
-        .highlight_style(theme.selected_style().add_modifier(Modifier::BOLD));
-    frame.render_widget(tabs, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(masthead_style),
+        area,
+    );
 }
 
-fn render_stories(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, theme: &Theme) {
+fn render_stories(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    capacity: usize,
+    separator: bool,
+    theme: &Theme,
+) {
     if area.is_empty() {
         return;
     }
@@ -170,7 +187,7 @@ fn render_stories(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize,
             sanitize_single_line(app.filter())
         )
     };
-    let block = pane_block(title, app.focus() == FocusPane::Stories, theme);
+    let block = pane_block(title, app.focus() == FocusPane::Stories, separator, theme);
 
     let offset = app.story_offset();
     let items: Vec<ListItem<'_>> = app
@@ -203,11 +220,7 @@ fn render_stories(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize,
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < items.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = if app.focus() == FocusPane::Stories {
-        theme.selected_style()
-    } else {
-        theme.muted_style().add_modifier(Modifier::BOLD)
-    };
+    let highlight_style = theme.selected_style();
     let list = List::new(items)
         .block(block)
         .highlight_symbol("▸ ")
@@ -220,7 +233,7 @@ fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> 
     let title_style = if item.is_unavailable() {
         theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
     } else {
-        Style::default().fg(theme.foreground)
+        theme.primary_style()
     };
     let title = Line::from(vec![
         Span::styled(marker, Style::default().fg(theme.warning)),
@@ -235,21 +248,28 @@ fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> 
             .unwrap_or("news.ycombinator.com"),
     );
     let age = age(item.time);
-    let metadata = if age.is_empty() {
-        format!(
-            "  {} pts · {} comments · {author} · {domain}",
-            item.score, item.descendants
-        )
+    let mut metadata = vec![Span::styled(
+        format!("  {} pts · {} comments · ", item.score, item.descendants),
+        theme.muted_style(),
+    )];
+    metadata.push(Span::styled(author, theme.primary_style()));
+    let suffix = if age.is_empty() {
+        format!(" · {domain}")
     } else {
-        format!(
-            "  {} pts · {} comments · {author} · {age} · {domain}",
-            item.score, item.descendants
-        )
+        format!(" · {age} · {domain}")
     };
-    ListItem::new(vec![title, Line::styled(metadata, theme.muted_style())])
+    metadata.push(Span::styled(suffix, theme.muted_style()));
+    ListItem::new(vec![title, Line::from(metadata)])
 }
 
-fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, theme: &Theme) {
+fn render_thread(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    capacity: usize,
+    separator: bool,
+    theme: &Theme,
+) {
     if area.is_empty() {
         return;
     }
@@ -260,7 +280,7 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
     } else {
         format!(" Thread ({visible_count}/{total_count}) ")
     };
-    let block = pane_block(title, app.focus() == FocusPane::Thread, theme);
+    let block = pane_block(title, app.focus() == FocusPane::Thread, separator, theme);
     if app.thread().is_none() {
         let message = if app.loading() {
             "Loading thread…"
@@ -297,11 +317,7 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < comments.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = if app.focus() == FocusPane::Thread {
-        theme.selected_style()
-    } else {
-        theme.muted_style().add_modifier(Modifier::BOLD)
-    };
+    let highlight_style = theme.selected_style();
     let list = List::new(comments)
         .block(block)
         .highlight_symbol("▸ ")
@@ -311,7 +327,6 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
 
 fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'static> {
     let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
-    let indent = "  ".repeat(depth);
     let fold = if collapsed {
         "▸"
     } else if comment.kids.is_empty() && comment.children.is_empty() {
@@ -325,11 +340,12 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
         sanitize_single_line(comment.by.as_deref().unwrap_or("unknown"))
     };
     let age = age(comment.time);
-    let metadata = if age.is_empty() {
-        format!("{indent}{fold} {author}")
-    } else {
-        format!("{indent}{fold} {author} · {age}")
-    };
+    let mut metadata = depth_rails(depth, theme);
+    metadata.push(Span::styled(format!("{fold} "), theme.muted_style()));
+    metadata.push(Span::styled(author, theme.primary_style()));
+    if !age.is_empty() {
+        metadata.push(Span::styled(format!(" · {age}"), theme.muted_style()));
+    }
     let body = comment
         .text
         .as_deref()
@@ -338,12 +354,24 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
         .filter(|body| !body.is_empty())
         .unwrap_or_else(|| "[deleted]".to_owned());
     ListItem::new(vec![
-        Line::styled(metadata, theme.accent_style()),
-        Line::styled(
-            format!("{indent}  {body}"),
-            Style::default().fg(theme.foreground),
+        Line::from(metadata),
+        Line::from(
+            [
+                depth_rails(depth, theme),
+                vec![
+                    Span::styled("  ", theme.muted_style()),
+                    Span::styled(body, theme.primary_style()),
+                ],
+            ]
+            .concat(),
         ),
     ])
+}
+
+fn depth_rails(depth: usize, theme: &Theme) -> Vec<Span<'static>> {
+    (0..depth)
+        .map(|level| Span::styled("│ ", theme.depth_style(level)))
+        .collect()
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
@@ -353,6 +381,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme
     let block = pane_block(
         " Detail / article ",
         app.focus() == FocusPane::Detail,
+        false,
         theme,
     );
     let mut lines = Vec::new();
@@ -371,7 +400,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme
         lines.extend(
             sanitize_text(&article.body)
                 .lines()
-                .map(|line| Line::raw(line.to_owned())),
+                .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
         );
     } else if let Some(comment) = app.selected_comment() {
         lines.extend(comment_detail(comment, theme));
@@ -413,7 +442,10 @@ fn comment_detail(comment: &Comment, theme: &Theme) -> Vec<Line<'static>> {
         .map(|body| sanitize_text(&body))
         .filter(|body| !body.is_empty())
         .unwrap_or_else(|| "[deleted]".to_owned());
-    lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+    lines.extend(
+        body.lines()
+            .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
+    );
     lines
 }
 
@@ -440,7 +472,10 @@ fn item_detail(item: &Item, theme: &Theme) -> Vec<Line<'static>> {
     if let Some(body) = &item.text {
         lines.push(Line::raw(""));
         let body = sanitize_text(&strip_html(body));
-        lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+        lines.extend(
+            body.lines()
+                .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
+        );
     } else {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -506,13 +541,21 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMod
 
     let focus = format!("{} · {}", mode_label(mode), app.focus().label());
     state.push(Span::styled(format!(" {focus} "), theme.muted_style()));
+    let hints = if area.width >= 100 {
+        "  ? help · q quit · Tab pane · L layout · Alt+h/l resize · Alt+0 reset"
+    } else if area.width >= 64 {
+        "  ? help · q quit · Tab pane · L layout"
+    } else {
+        "  ? help · q quit"
+    };
+    state.push(Span::styled(hints, theme.muted_style()));
 
     let lines = vec![Line::from(state)];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let popup = centered_rect(area, 74, 20);
+    let popup = centered_rect(area, 74, 24);
     if popup.is_empty() {
         return;
     }
@@ -522,10 +565,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("j/k or ↑/↓   move selection / scroll article"),
         Line::raw("h/l or ←/→   move between panes"),
         Line::raw("Tab           next pane"),
+        Line::raw("BackTab       previous pane"),
         Line::raw("Ctrl+U/D      half-page up/down"),
         Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
         Line::raw("[/] or 1–6    switch feed"),
+        Line::raw(""),
+        Line::styled("Layout", theme.accent_style()),
+        Line::raw("L             toggle two / three panes"),
+        Line::raw("Alt+h / Alt+l shrink / grow focused pane"),
+        Line::raw("Alt+0         restore config / built-in splits"),
         Line::raw(""),
         Line::styled("Find and save", theme.accent_style()),
         Line::raw("/             search Hacker News"),
@@ -574,20 +623,31 @@ fn render_prompt(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-fn pane_block(title: impl Into<String>, focused: bool, theme: &Theme) -> Block<'static> {
-    let border = if focused {
-        theme.highlight
+fn pane_block(
+    title: impl Into<String>,
+    focused: bool,
+    separator: bool,
+    theme: &Theme,
+) -> Block<'static> {
+    let border = if focused { theme.accent } else { theme.border };
+    let title_style = if focused {
+        theme
+            .base_style()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
-        theme.border
+        theme.primary_style()
     };
-    let mut style = Style::default().fg(border);
-    if focused {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    let title = format!("{}{}", if focused { "◆ " } else { "  " }, title.into());
+    let borders = if separator {
+        Borders::TOP | Borders::RIGHT
+    } else {
+        Borders::TOP
+    };
     Block::default()
-        .title(title.into())
-        .borders(Borders::ALL)
-        .border_style(style)
+        .title(Line::styled(title, title_style))
+        .borders(borders)
+        .border_style(Style::default().fg(border))
 }
 
 fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
@@ -875,7 +935,7 @@ mod tests {
             (120, "2-pane", true),
             (119, "2-pane", true),
             (80, "2-pane", true),
-            (79, "1-pane", false),
+            (79, "1-pane", true),
         ] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -897,8 +957,6 @@ mod tests {
             );
             assert!(rendered.contains("? help"));
             assert!(rendered.contains("q quit"));
-            assert!(rendered.contains("Ctrl+U/D half-page"));
-            assert!(rendered.contains("PgUp/PgDn page"));
             assert_eq!(rendered.contains("Tab pane"), expects_tab_hint);
         }
     }
@@ -929,8 +987,8 @@ mod tests {
                 output.push_str(cell.symbol());
                 output
             });
-        assert!(rendered.contains("Ctrl+U/D half-page"));
-        assert!(rendered.contains("PgUp/PgDn page"));
+        assert!(rendered.contains("L layout"));
+        assert!(rendered.contains("Alt+h/l resize"));
         assert!(rendered.contains("Press a to read here"));
 
         let detail = layout_for(
@@ -943,7 +1001,7 @@ mod tests {
         .expect("detail pane");
         assert_eq!(
             buffer.cell((detail.x, detail.y)).map(|cell| cell.fg),
-            Some(theme.highlight)
+            Some(theme.accent)
         );
 
         let _ = app.handle_key(crossterm::event::KeyEvent::new(
@@ -1024,7 +1082,7 @@ mod tests {
         );
         let _ = app.handle_key(page_down);
         let _ = app.handle_key(page_down);
-        assert_eq!(app.detail_scroll(), 25);
+        assert_eq!(app.detail_scroll(), 21);
 
         terminal
             .draw(|frame| render(frame, &mut app, &theme))
@@ -1045,7 +1103,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut app, &theme))
             .expect("resized detail frame renders");
-        assert_eq!(app.detail_scroll(), 9);
+        assert_eq!(app.detail_scroll(), 5);
         let resized =
             terminal
                 .backend()
