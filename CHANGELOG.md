@@ -7,6 +7,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1.0] - 2026-08-10
+
+### Added
+
+- A cache architecture decision record that explains why SQLite remains the
+  best fit for the local, offline-first workload.
+- A deeper Redis/Valkey design comparison, embedded and in-memory alternatives,
+  backend revisit triggers, and a bounded-retention optimization roadmap.
+
 ## [0.1.0.0] - 2026-08-10
 
 ### Added
@@ -42,6 +51,7 @@ All notable changes to this project are documented here. The format follows
 - DNS-rebinding-safe, bounded in-terminal article reading.
 - Checksummed multi-platform cargo-dist releases with SBOMs and attestations.
 
-[Unreleased]: https://github.com/alin9661/hnx/compare/v0.1.0...HEAD
-[0.1.0.0]: https://github.com/alin9661/hnx/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/alin9661/hnx/compare/v0.1.1...HEAD
+[0.1.1.0]: https://github.com/alin9661/hnx/compare/v0.1.0...v0.1.1
+[0.1.0.0]: https://github.com/alin9661/hnx/pull/7
 [0.1.0]: https://github.com/alin9661/hnx/releases/tag/v0.1.0
