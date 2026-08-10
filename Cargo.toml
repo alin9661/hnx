@@ -35,6 +35,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.20"
 wiremock = "0.6"
 
+[[bench]]
+name = "rendering"
+harness = false
+
 [profile.release]
 strip = true
 lto = true

@@ -1,11 +1,13 @@
 //! Core library for the `hnx` Hacker News terminal client.
 
 pub mod api;
+pub mod app;
 pub mod article;
 pub mod cache;
 pub mod model;
 pub mod sanitize;
 pub mod theme;
+pub mod ui;
 
 pub use api::{ApiError, DataSource, HybridClient, SearchType};
 pub use cache::Cache;
