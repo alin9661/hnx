@@ -220,7 +220,7 @@ fn render_stories(
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < items.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = theme.selected_style();
+    let highlight_style = Style::default().bg(theme.selected_bg);
     let list = List::new(items)
         .block(block)
         .highlight_symbol("▸ ")
@@ -317,7 +317,7 @@ fn render_thread(
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < comments.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = theme.selected_style();
+    let highlight_style = Style::default().bg(theme.selected_bg);
     let list = List::new(comments)
         .block(block)
         .highlight_symbol("▸ ")
@@ -751,7 +751,7 @@ fn strip_html(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Modifier};
 
     use super::{centered_rect, layout_for, render};
     use crate::{
@@ -778,6 +778,37 @@ mod tests {
             stale: true,
             fetched_at: 1,
         }
+    }
+
+    fn find_run(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let symbols: Vec<_> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                if symbols.iter().enumerate().all(|(offset, symbol)| {
+                    u16::try_from(offset)
+                        .ok()
+                        .and_then(|offset| buffer.cell((x.saturating_add(offset), y)))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                }) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("rendered text `{needle}` was not found");
+    }
+
+    fn cells_for<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        text: &str,
+    ) -> impl Iterator<Item = &'a ratatui::buffer::Cell> {
+        let (x, y) = find_run(buffer, text);
+        (0..text.chars().count()).map(move |offset| {
+            let offset = u16::try_from(offset).expect("test text fits terminal");
+            buffer.cell((x + offset, y)).expect("rendered cell exists")
+        })
     }
 
     #[test]
@@ -927,6 +958,141 @@ mod tests {
                     output
                 });
         assert!(rendered.contains("rust terminal"));
+    }
+
+    #[test]
+    fn masthead_fills_every_cell_and_marks_active_feed_without_color_alone() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("masthead renders");
+
+        let buffer = terminal.backend().buffer();
+        for x in 0..buffer.area.width {
+            let cell = buffer.cell((x, 0)).expect("masthead cell");
+            assert_eq!(cell.bg, theme.accent, "masthead x={x}");
+            assert_eq!(cell.fg, theme.accent_fg, "masthead x={x}");
+            assert!(cell.modifier.contains(Modifier::BOLD), "masthead x={x}");
+        }
+        let active: Vec<_> = cells_for(buffer, "Top").collect();
+        assert!(
+            active
+                .iter()
+                .all(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+    }
+
+    #[test]
+    fn classic_primary_metadata_and_selection_styles_are_semantic() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("classic frame renders");
+        let buffer = terminal.backend().buffer();
+
+        for text in ["A carefully rendered story", "alice"] {
+            assert!(cells_for(buffer, text).all(|cell| {
+                cell.fg == theme.foreground && cell.modifier.contains(Modifier::BOLD)
+            }));
+        }
+        assert!(
+            cells_for(buffer, "123 pts")
+                .all(|cell| { cell.fg == theme.muted && cell.modifier.contains(Modifier::DIM) })
+        );
+        assert!(buffer.content().iter().any(|cell| {
+            cell.bg == ratatui::style::Color::Rgb(229, 228, 222)
+                && cell.fg == ratatui::style::Color::Rgb(0, 0, 0)
+        }));
+    }
+
+    #[test]
+    fn custom_and_no_color_themes_preserve_visual_cues() {
+        let mut custom = Theme::midnight();
+        custom.accent = ratatui::style::Color::Rgb(1, 2, 3);
+        custom.accent_fg = ratatui::style::Color::Rgb(250, 249, 248);
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        terminal
+            .draw(|frame| render(frame, &mut app, &custom))
+            .expect("custom frame renders");
+        assert!((0..90).all(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, 0))
+                .is_some_and(|cell| cell.bg == custom.accent && cell.fg == custom.accent_fg)
+        }));
+
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::no_color()))
+            .expect("no-color frame renders");
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content().iter().all(|cell| {
+            cell.fg == ratatui::style::Color::Reset && cell.bg == ratatui::style::Color::Reset
+        }));
+        assert!(cells_for(buffer, "Top").all(|cell| {
+            cell.modifier.contains(Modifier::BOLD) && cell.modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+    }
+
+    #[test]
+    fn comment_depth_rails_use_semantic_roles_in_three_pane_mode() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.configure_layout(
+            LayoutPreferences::default().with_mode(PaneMode::Three),
+            LayoutPreferences::default(),
+        );
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![
+                Comment {
+                    id: 10,
+                    by: Some("root".to_owned()),
+                    ..Comment::default()
+                },
+                Comment {
+                    id: 11,
+                    by: Some("nested".to_owned()),
+                    depth: 2,
+                    ..Comment::default()
+                },
+            ],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("three-pane frame renders");
+        let rail_colors: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "│")
+            .map(|cell| cell.fg)
+            .collect();
+        assert!(rail_colors.contains(&theme.accent));
+        assert!(rail_colors.contains(&theme.link));
+        assert!(app.visible_panes().contains(FocusPane::Detail));
     }
 
     #[test]
