@@ -301,3 +301,196 @@ pub enum LayoutError {
     #[error("pane resize rejected; every pane must remain at least {0}%")]
     ResizeRejected(u8),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visible(layout: PaneLayout) -> Vec<Rect> {
+        [layout.stories, layout.thread, layout.detail]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn assert_tiles(area: Rect, layout: PaneLayout) {
+        let panes = visible(layout);
+        assert!(!panes.is_empty());
+        assert_eq!(panes[0].x, area.x);
+        assert_eq!(panes.last().expect("pane exists").right(), area.right());
+        assert!(
+            panes
+                .iter()
+                .all(|pane| pane.y == area.y && pane.height == area.height)
+        );
+        for pair in panes.windows(2) {
+            assert_eq!(pair[0].right(), pair[1].x, "pane gap or overlap");
+        }
+        assert_eq!(panes.iter().map(|pane| pane.width).sum::<u16>(), area.width);
+    }
+
+    #[test]
+    fn defaults_are_valid_and_stable() {
+        let preferences = LayoutPreferences::default()
+            .validate()
+            .expect("defaults validate");
+        assert_eq!(preferences.mode, PaneMode::Two);
+        assert_eq!(preferences.two, [44, 56]);
+        assert_eq!(preferences.three, [38, 34, 28]);
+        assert_eq!(preferences.two_min_width, 80);
+        assert_eq!(preferences.three_min_width, 120);
+    }
+
+    #[test]
+    fn boundary_widths_follow_requested_mode() {
+        let area = |width| Rect::new(0, 0, width, 20);
+        let two = LayoutPreferences::default();
+        assert_eq!(
+            resolve_panes(area(79), &two, FocusPane::Thread, SecondaryPane::Thread).mode,
+            ResolvedMode::One
+        );
+        assert_eq!(
+            resolve_panes(area(80), &two, FocusPane::Thread, SecondaryPane::Thread).mode,
+            ResolvedMode::Two
+        );
+
+        let three = two.with_mode(PaneMode::Three);
+        assert_eq!(
+            resolve_panes(area(119), &three, FocusPane::Thread, SecondaryPane::Thread).mode,
+            ResolvedMode::Two
+        );
+        assert_eq!(
+            resolve_panes(area(120), &three, FocusPane::Thread, SecondaryPane::Thread).mode,
+            ResolvedMode::Three
+        );
+    }
+
+    #[test]
+    fn layouts_tile_odd_widths_and_nonzero_origins() {
+        for (width, mode) in [
+            (121, PaneMode::Three),
+            (81, PaneMode::Two),
+            (17, PaneMode::Three),
+        ] {
+            let area = Rect::new(7, 11, width, 23);
+            let preferences = LayoutPreferences::default().with_mode(mode);
+            let layout =
+                resolve_panes(area, &preferences, FocusPane::Detail, SecondaryPane::Detail);
+            assert_tiles(area, layout);
+        }
+    }
+
+    #[test]
+    fn custom_breakpoints_are_honored() {
+        let preferences = LayoutPreferences {
+            mode: PaneMode::Three,
+            two_min_width: 60,
+            three_min_width: 90,
+            ..LayoutPreferences::default()
+        };
+        assert_eq!(
+            resolve_panes(
+                Rect::new(0, 0, 89, 10),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Two
+        );
+        assert_eq!(
+            resolve_panes(
+                Rect::new(0, 0, 90, 10),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Three
+        );
+    }
+
+    #[test]
+    fn minimum_columns_force_further_fallback() {
+        let preferences = LayoutPreferences {
+            mode: PaneMode::Three,
+            two: [85, 15],
+            three: [70, 15, 15],
+            two_min_width: 1,
+            three_min_width: 1,
+        };
+        let layout = resolve_panes(
+            Rect::new(0, 0, 100, 10),
+            &preferences,
+            FocusPane::Detail,
+            SecondaryPane::Detail,
+        );
+        assert_eq!(layout.mode, ResolvedMode::One);
+        assert_eq!(layout.detail.expect("detail visible").width, 100);
+    }
+
+    #[test]
+    fn validation_rejects_bad_ratios_and_breakpoints() {
+        assert!(matches!(
+            LayoutPreferences {
+                two: [50, 49],
+                ..LayoutPreferences::default()
+            }
+            .validate(),
+            Err(LayoutError::RatioTotal { .. })
+        ));
+        assert!(matches!(
+            LayoutPreferences {
+                three: [70, 20, 10],
+                ..LayoutPreferences::default()
+            }
+            .validate(),
+            Err(LayoutError::RatioTooSmall { .. })
+        ));
+        assert!(matches!(
+            LayoutPreferences {
+                two_min_width: 100,
+                three_min_width: 90,
+                ..LayoutPreferences::default()
+            }
+            .validate(),
+            Err(LayoutError::BreakpointOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn resizing_uses_the_focused_divider_and_enforces_minimums() {
+        let two = LayoutPreferences::default();
+        assert_eq!(
+            two.resized(FocusPane::Stories, 2).expect("resize").two,
+            [46, 54]
+        );
+        assert_eq!(
+            two.resized(FocusPane::Thread, 2).expect("resize").two,
+            [42, 58]
+        );
+
+        let three = two.with_mode(PaneMode::Three);
+        assert_eq!(
+            three.resized(FocusPane::Stories, 2).expect("resize").three,
+            [40, 32, 28]
+        );
+        assert_eq!(
+            three.resized(FocusPane::Thread, 2).expect("resize").three,
+            [38, 36, 26]
+        );
+        assert_eq!(
+            three.resized(FocusPane::Detail, 2).expect("resize").three,
+            [38, 32, 30]
+        );
+
+        let extreme = LayoutPreferences {
+            two: [85, 15],
+            ..LayoutPreferences::default()
+        };
+        assert!(matches!(
+            extreme.resized(FocusPane::Stories, 2),
+            Err(LayoutError::ResizeRejected(15))
+        ));
+    }
+}
