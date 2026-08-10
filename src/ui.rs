@@ -23,9 +23,9 @@ pub const MEDIUM_MIN_WIDTH: u16 = 80;
 /// The responsive content arrangement selected for a terminal width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Story list, thread, and article/detail panes.
+    /// Story list and the active secondary pane at the wide breakpoint.
     Wide,
-    /// Story list and the most recently focused secondary pane.
+    /// Story list and the active secondary pane.
     Medium,
     /// Only the focused pane.
     Narrow,
@@ -81,11 +81,7 @@ pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiL
     );
 
     let (stories, thread, detail) = match mode {
-        LayoutMode::Wide => {
-            let [stories, thread, detail] = split_three(content, 38, 34);
-            (Some(stories), Some(thread), Some(detail))
-        }
-        LayoutMode::Medium => {
+        LayoutMode::Wide | LayoutMode::Medium => {
             let [stories, secondary_area] = split_two(content, 44);
             match secondary {
                 SecondaryPane::Thread => (Some(stories), Some(secondary_area), None),
@@ -129,7 +125,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     let comment_rows = layout.thread.map_or(1, |rect| {
         usize::from(rect.height.saturating_sub(2) / 2).max(1)
     });
+    let detail_rows = layout
+        .detail
+        .map_or(1, |rect| usize::from(rect.height.saturating_sub(2)).max(1));
     app.set_viewports(story_rows, comment_rows);
+    app.set_detail_viewport(detail_rows);
 
     render_tabs(frame, layout.tabs, app, theme);
     if let Some(rect) = layout.stories {
@@ -163,27 +163,6 @@ fn split_two(area: Rect, left_percent: u16) -> [Rect; 2] {
     ]
 }
 
-fn split_three(area: Rect, first_percent: u16, second_percent: u16) -> [Rect; 3] {
-    let first_width = area.width.saturating_mul(first_percent) / 100;
-    let second_width = area.width.saturating_mul(second_percent) / 100;
-    let used = first_width.saturating_add(second_width).min(area.width);
-    [
-        Rect::new(area.x, area.y, first_width, area.height),
-        Rect::new(
-            area.x.saturating_add(first_width),
-            area.y,
-            second_width.min(area.width.saturating_sub(first_width)),
-            area.height,
-        ),
-        Rect::new(
-            area.x.saturating_add(used),
-            area.y,
-            area.width.saturating_sub(used),
-            area.height,
-        ),
-    ]
-}
-
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -207,11 +186,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
                 .border_style(Style::default().fg(theme.border)),
         )
         .style(theme.muted_style())
-        .highlight_style(
-            theme
-                .accent_style()
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        );
+        .highlight_style(theme.selected_style().add_modifier(Modifier::BOLD));
     frame.render_widget(tabs, area);
 }
 
@@ -570,11 +545,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode,
     let mut lines = vec![Line::from(state)];
     if area.height > 1 {
         let keys = if area.width >= WIDE_MIN_WIDTH {
-            " ? help  q quit  j/k move  Tab pane  Enter load/fold  a read  o open  / search  f filter  b save  O offline "
+            " ? help  q quit  j/k move  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane  Enter select  a read  o open "
         } else if area.width >= MEDIUM_MIN_WIDTH {
-            " ? help  q quit  j/k move  Tab pane  Enter select  / search  b save "
+            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane "
         } else {
-            " ? help  q quit  j/k move  Tab pane "
+            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page "
         };
         lines.push(Line::styled(keys, theme.muted_style()));
     }
@@ -592,6 +567,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("j/k or ↑/↓   move selection / scroll article"),
         Line::raw("h/l or ←/→   move between panes"),
         Line::raw("Tab           next pane"),
+        Line::raw("Ctrl+U/D      half-page up/down"),
+        Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
         Line::raw("[/] or 1–6    switch feed"),
         Line::raw(""),
@@ -675,8 +652,7 @@ fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
 
 fn mode_label(mode: LayoutMode) -> &'static str {
     match mode {
-        LayoutMode::Wide => "3-pane",
-        LayoutMode::Medium => "2-pane",
+        LayoutMode::Wide | LayoutMode::Medium => "2-pane",
         LayoutMode::Narrow => "1-pane",
     }
 }
@@ -796,23 +772,33 @@ mod tests {
     }
 
     #[test]
-    fn wide_medium_and_narrow_expose_three_two_and_one_content_panes() {
-        let wide = layout_for(
-            Rect::new(0, 0, 120, 30),
-            FocusPane::Stories,
-            SecondaryPane::Thread,
-        );
-        assert!(wide.stories.is_some() && wide.thread.is_some() && wide.detail.is_some());
+    fn wide_and_medium_render_stories_with_the_active_secondary_pane() {
+        for width in [120, 119, 80] {
+            let thread = layout_for(
+                Rect::new(0, 0, width, 30),
+                FocusPane::Stories,
+                SecondaryPane::Thread,
+            );
+            let stories = thread.stories.expect("stories pane");
+            let right = thread.thread.expect("thread pane");
+            assert!(thread.detail.is_none());
+            assert_eq!(stories.width, width * 44 / 100);
+            assert_eq!(right.x, stories.width);
+            assert_eq!(right.width, width - stories.width);
 
-        let medium = layout_for(
-            Rect::new(0, 0, 100, 30),
-            FocusPane::Stories,
-            SecondaryPane::Detail,
-        );
-        assert!(medium.stories.is_some() && medium.thread.is_none() && medium.detail.is_some());
+            let detail = layout_for(
+                Rect::new(0, 0, width, 30),
+                FocusPane::Detail,
+                SecondaryPane::Detail,
+            );
+            assert!(detail.stories.is_some() && detail.thread.is_none() && detail.detail.is_some());
+        }
+    }
 
+    #[test]
+    fn narrow_layout_renders_only_the_focused_pane() {
         let narrow = layout_for(
-            Rect::new(0, 0, 60, 30),
+            Rect::new(0, 0, 79, 30),
             FocusPane::Thread,
             SecondaryPane::Detail,
         );
@@ -863,7 +849,7 @@ mod tests {
     #[test]
     fn every_responsive_boundary_renders_the_expected_mode() {
         for (width, expected_mode) in [
-            (120, "3-pane"),
+            (120, "2-pane"),
             (119, "2-pane"),
             (80, "2-pane"),
             (79, "1-pane"),

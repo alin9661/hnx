@@ -698,7 +698,6 @@ impl App {
     }
 
     /// Records the number of wrapped article rows visible in the Detail pane.
-    #[allow(dead_code)]
     pub(crate) fn set_detail_viewport(&mut self, rows: usize) {
         self.detail_viewport = rows.max(1);
     }
