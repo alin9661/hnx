@@ -36,6 +36,12 @@ After publication:
 cargo install hnx
 ```
 
+Or install the latest release binary on macOS or Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alin9661/hnx/releases/latest/download/hnx-installer.sh | sh
+```
+
 ## Use
 
 Launch the interactive client:
@@ -98,9 +104,11 @@ or grows the focused pane by two percentage points, and `Alt+0` clears saved
 live overrides. `t` selects the thread and `d` selects detail. `Enter` loads a
 thread or folds a comment, `/` searches, `f` applies a
 case-insensitive regex filter, `b` bookmarks, `a` reads an article in-terminal,
-`o` opens a link, `O` toggles offline mode, `r` refreshes, `?` opens help, and
-`q` quits. The status line always identifies offline/stale/partial data and its
-source.
+`o` opens a link, `O` toggles offline mode, `r` refreshes, and `n`/`p` load the
+next/previous 30-story page. Opening a story marks it read; `m` toggles
+read/unread, and read state persists across launches. `?` opens help, and `q`
+quits or closes help. The status line always identifies offline/stale/partial
+data and its source. Comment bodies reflow to the live thread-pane width.
 
 The default `classic` theme uses Y Combinator orange (`#FF6600`) and Hacker
 News cream (`#F7F6F0`). `midnight`, an ANSI 16-color theme, `NO_COLOR`, and
