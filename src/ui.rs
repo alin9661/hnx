@@ -375,9 +375,7 @@ fn render_thread(
         .visible_comment_window(offset, capacity)
         .enumerate()
         .map(|(relative, comment)| {
-            let height = comment_height(comment, row_width)
-                .min(remaining_rows)
-                .max(1);
+            let height = comment_height(comment, row_width, remaining_rows).max(1);
             remaining_rows = remaining_rows.saturating_sub(height);
             comment_row(
                 comment,
@@ -441,9 +439,8 @@ fn comment_row(
     }
     let body = comment_body(comment);
     let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
-    let mut body_lines = wrap_text(&body, body_width.max(1));
-    let truncated = body_lines.len().saturating_add(1) > max_lines;
-    body_lines.truncate(max_lines.saturating_sub(1));
+    let (mut body_lines, truncated) =
+        wrap_text_limited(&body, body_width.max(1), max_lines.saturating_sub(1));
     if truncated && max_lines == 1 {
         metadata.push(Span::styled(" …", theme.muted_style()));
     } else if truncated && let Some(last) = body_lines.last_mut() {
@@ -471,7 +468,8 @@ fn comment_capacity(app: &App, area: Rect, separator: bool) -> usize {
     let mut used = 0_usize;
     let mut count = 0_usize;
     for comment in app.visible_comment_window(app.comment_offset(), usize::MAX) {
-        let height = comment_height(comment, row_width);
+        let remaining = available_rows.saturating_sub(used);
+        let height = comment_height(comment, row_width, remaining.saturating_add(1));
         if count > 0 && used.saturating_add(height) > available_rows {
             break;
         }
@@ -493,10 +491,12 @@ fn comment_row_width(area: Rect, separator: bool) -> usize {
     .max(1)
 }
 
-fn comment_height(comment: &Comment, row_width: usize) -> usize {
+fn comment_height(comment: &Comment, row_width: usize, max_height: usize) -> usize {
     let depth = comment_depth(comment, row_width);
     let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
-    1_usize.saturating_add(wrap_text(&comment_body(comment), body_width.max(1)).len())
+    let body_limit = max_height.saturating_sub(1);
+    let (lines, _) = wrap_text_limited(&comment_body(comment), body_width.max(1), body_limit);
+    1_usize.saturating_add(lines.len()).min(max_height.max(1))
 }
 
 fn comment_depth(comment: &Comment, row_width: usize) -> usize {
@@ -515,7 +515,15 @@ fn comment_body(comment: &Comment) -> String {
         .unwrap_or_else(|| "[deleted]".to_owned())
 }
 
+#[cfg(test)]
 fn wrap_text(input: &str, width: usize) -> Vec<String> {
+    wrap_text_limited(input, width, usize::MAX).0
+}
+
+fn wrap_text_limited(input: &str, width: usize, max_lines: usize) -> (Vec<String>, bool) {
+    if max_lines == 0 {
+        return (Vec::new(), !input.trim().is_empty());
+    }
     let width = width.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -530,6 +538,9 @@ fn wrap_text(input: &str, width: usize) -> Vec<String> {
             continue;
         }
         if !line.is_empty() {
+            if lines.len() == max_lines {
+                return (lines, true);
+            }
             lines.push(std::mem::take(&mut line));
             line_width = 0;
         }
@@ -542,13 +553,22 @@ fn wrap_text(input: &str, width: usize) -> Vec<String> {
             let grapheme_width = Span::raw(grapheme).width();
             if grapheme_width > width {
                 if !line.is_empty() {
+                    if lines.len() == max_lines {
+                        return (lines, true);
+                    }
                     lines.push(std::mem::take(&mut line));
                     line_width = 0;
+                }
+                if lines.len() == max_lines {
+                    return (lines, true);
                 }
                 lines.push("…".to_owned());
                 continue;
             }
             if !line.is_empty() && line_width.saturating_add(grapheme_width) > width {
+                if lines.len() == max_lines {
+                    return (lines, true);
+                }
                 lines.push(std::mem::take(&mut line));
                 line_width = 0;
             }
@@ -557,12 +577,15 @@ fn wrap_text(input: &str, width: usize) -> Vec<String> {
         }
     }
     if !line.is_empty() {
+        if lines.len() == max_lines {
+            return (lines, true);
+        }
         lines.push(line);
     }
     if lines.is_empty() {
         lines.push(String::new());
     }
-    lines
+    (lines, false)
 }
 
 fn primary_style(theme: &Theme, selected: bool) -> Style {
@@ -1023,7 +1046,7 @@ fn strip_html(input: &str) -> String {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Modifier};
 
-    use super::{centered_rect, layout_for, render, status_suffix, wrap_text};
+    use super::{centered_rect, layout_for, render, status_suffix, wrap_text, wrap_text_limited};
     use crate::{
         app::{App, ArticleView, FocusPane, SecondaryPane},
         layout::{LayoutPreferences, PaneMode, ResolvedMode},
@@ -1044,6 +1067,7 @@ mod tests {
                 descendants: 45,
                 ..Item::default()
             }],
+            slot_count: 1,
             source: Source::Cache,
             stale: true,
             fetched_at: 1,
@@ -1293,6 +1317,9 @@ mod tests {
     fn wrapping_keeps_unicode_graphemes_intact() {
         assert_eq!(wrap_text("👩‍💻👩‍💻", 2), vec!["👩‍💻", "👩‍💻"]);
         assert_eq!(wrap_text("界", 1), vec!["…"]);
+        let (lines, truncated) = wrap_text_limited(&"word ".repeat(100_000), 8, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(truncated);
     }
 
     #[test]
