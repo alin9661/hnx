@@ -348,7 +348,10 @@ fn split<const N: usize>(area: Rect, ratios: &[u8; N]) -> [Rect; N] {
         let width = if index + 1 == N {
             remaining
         } else {
-            area.width.saturating_mul(u16::from(ratios[index])) / 100
+            let proportional = u32::from(area.width) * u32::from(ratios[index]) / 100;
+            u16::try_from(proportional)
+                .unwrap_or(area.width)
+                .min(remaining)
         };
         let rect = Rect::new(x, area.y, width, area.height);
         x = x.saturating_add(width);
@@ -457,6 +460,48 @@ mod tests {
                 resolve_panes(area, &preferences, FocusPane::Detail, SecondaryPane::Detail);
             assert_tiles(area, layout);
         }
+    }
+
+    #[test]
+    fn wide_layouts_preserve_ratios_without_u16_overflow() {
+        let area = Rect::new(0, 0, 2_000, 20);
+        let two = resolve_panes(
+            area,
+            &LayoutPreferences::default(),
+            FocusPane::Stories,
+            SecondaryPane::Thread,
+        );
+        assert_eq!(
+            visible(two)
+                .into_iter()
+                .map(|rect| rect.width)
+                .collect::<Vec<_>>(),
+            vec![880, 1_120]
+        );
+
+        let three = resolve_panes(
+            area,
+            &LayoutPreferences::default().with_mode(PaneMode::Three),
+            FocusPane::Stories,
+            SecondaryPane::Thread,
+        );
+        assert_eq!(
+            visible(three)
+                .into_iter()
+                .map(|rect| rect.width)
+                .collect::<Vec<_>>(),
+            vec![760, 680, 560]
+        );
+        assert_tiles(area, three);
+
+        let maximum = Rect::new(0, 0, u16::MAX, 1);
+        let maximum_layout = resolve_panes(
+            maximum,
+            &LayoutPreferences::default().with_mode(PaneMode::Three),
+            FocusPane::Stories,
+            SecondaryPane::Thread,
+        );
+        assert_tiles(maximum, maximum_layout);
     }
 
     #[test]

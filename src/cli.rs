@@ -36,7 +36,7 @@ use crate::{
     app::{App, AppAction, ArticleView},
     article::{Article as FetchedArticle, ArticleClient},
     cache::{Cache, CacheEntry, CacheError},
-    config::{LayoutOverride, LayoutResolution, resolve_layout},
+    config::{ConfigError, LayoutOverride, LayoutResolution, resolve_layout},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
     sanitize::{sanitize_single_line, sanitize_text, validate_url},
     theme::Theme,
@@ -236,7 +236,7 @@ pub async fn run() -> Result<(), CliError> {
 
     if cli.command.is_some() && cli.config.is_some() {
         resolve_layout(cli.config.as_deref(), None, cli.layout.as_ref())
-            .map_err(|error| CliError::InvalidInput(error.to_string()))?;
+            .map_err(|error| config_input_error(&error))?;
     }
     let cache = cli
         .cache_dir
@@ -338,8 +338,8 @@ fn resolve_cached_layout(
         ),
     };
     let layout = resolve_layout(config_path, stored_layout.as_deref(), layout_override)
-        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
-    let warning = stored_read_warning.or(layout.warning.clone());
+        .map_err(|error| config_input_error(&error))?;
+    let warning = combine_warnings(stored_read_warning, layout.warning.clone());
     Ok((layout, warning))
 }
 
@@ -377,7 +377,19 @@ fn apply_requested_layout(
 ) -> Result<Option<String>, CliError> {
     let (layout, warning) = resolve_cached_layout(cache, config_path, layout_override)?;
     let persistence_warning = persist_startup_layout(cache, &layout);
-    Ok(warning.or(persistence_warning))
+    Ok(combine_warnings(warning, persistence_warning))
+}
+
+fn config_input_error(error: &ConfigError) -> CliError {
+    CliError::InvalidInput(sanitize_single_line(&error.to_string()))
+}
+
+fn combine_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
+    }
 }
 
 async fn run_feed(
@@ -1083,7 +1095,7 @@ async fn run_tui(
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
     let (layout, layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
     let persistence_warning = persist_startup_layout(&cache, &layout);
-    let layout_warning = layout_warning.or(persistence_warning);
+    let layout_warning = combine_warnings(layout_warning, persistence_warning);
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
@@ -1099,7 +1111,7 @@ async fn run_tui(
             app.set_error("No cached top feed is available offline");
         }
     }
-    if let Some(warning) = theme_warning.or(layout_warning)
+    if let Some(warning) = combine_warnings(theme_warning, layout_warning)
         && app.error().is_none()
     {
         app.set_status(warning);
@@ -1622,9 +1634,10 @@ mod tests {
 
     use super::{
         CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
-        apply_requested_layout, cleanup_once, handle_open_story, next_request_id, parse_item_id,
-        parse_limit, parse_search_query, persist_layout_action, write_buffered, write_comments,
-        write_item, write_json, write_page, write_thread,
+        apply_requested_layout, cleanup_once, combine_warnings, config_input_error,
+        handle_open_story, next_request_id, parse_item_id, parse_limit, parse_search_query,
+        persist_layout_action, write_buffered, write_comments, write_item, write_json, write_page,
+        write_thread,
     };
     use crate::{
         api::SearchType,
@@ -1761,6 +1774,28 @@ mod tests {
                 .three,
             [40, 30, 30]
         );
+    }
+
+    #[test]
+    fn independent_warnings_are_preserved_and_config_errors_are_sanitized() {
+        assert_eq!(
+            combine_warnings(
+                Some("fallback used".to_owned()),
+                Some("save failed".to_owned())
+            )
+            .as_deref(),
+            Some("fallback used; save failed")
+        );
+
+        let error = crate::config::ConfigError::NotRegular(std::path::PathBuf::from(
+            "bad\u{1b}]8;;https://example.invalid\u{7}name",
+        ));
+        let CliError::InvalidInput(message) = config_input_error(&error) else {
+            panic!("config errors remain invalid-input errors");
+        };
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+        assert!(!message.contains("https://example.invalid"));
     }
 
     #[test]

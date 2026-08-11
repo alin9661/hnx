@@ -1,7 +1,8 @@
 //! Platform configuration and layout-precedence resolution.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read as _,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -10,6 +11,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::layout::{LayoutError, LayoutPreferences, PaneMode};
+
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// A validated command-line layout request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,10 +200,36 @@ fn load_discovered_baseline(path: &Path) -> (LayoutPreferences, Option<String>) 
 }
 
 fn read_config(path: &Path) -> Result<LayoutPreferences, ConfigError> {
-    let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+    let metadata = fs::metadata(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
     })?;
+    if !metadata.is_file() {
+        return Err(ConfigError::NotRegular(path.to_path_buf()));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_CONFIG_BYTES,
+        });
+    }
+    let file = File::open(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut contents = String::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_CONFIG_BYTES,
+        });
+    }
     let config: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigError::Toml {
         path: path.to_path_buf(),
         source,
@@ -232,6 +261,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("config `{}` is not a regular file", .0.display())]
+    NotRegular(PathBuf),
+    #[error("config `{}` exceeds the {limit}-byte limit", path.display())]
+    TooLarge { path: PathBuf, limit: u64 },
     #[error("config `{}` is invalid: {source}", path.display())]
     Toml {
         path: PathBuf,
@@ -380,6 +413,19 @@ mod tests {
         assert!(matches!(
             resolve_layout(Some(invalid.path()), None, None),
             Err(ConfigError::Layout(_))
+        ));
+
+        let directory = tempfile::tempdir().expect("temp config directory");
+        assert!(matches!(
+            resolve_layout(Some(directory.path()), None, None),
+            Err(ConfigError::NotRegular(_))
+        ));
+
+        let oversized =
+            config(&"x".repeat(usize::try_from(MAX_CONFIG_BYTES).expect("limit fits usize") + 1));
+        assert!(matches!(
+            resolve_layout(Some(oversized.path()), None, None),
+            Err(ConfigError::TooLarge { .. })
         ));
     }
 
