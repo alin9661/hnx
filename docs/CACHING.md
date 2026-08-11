@@ -30,7 +30,7 @@ or a new deployment model.
 
 ## What SQLite currently provides
 
-The schema stores four TTL-managed network snapshots and two durable kinds of
+The schema stores four TTL-managed network snapshots and three durable kinds of
 user state:
 
 | Data | Key | Lifetime |
@@ -40,6 +40,7 @@ user state:
 | Thread | root item ID | TTL, readable when stale |
 | Search | search type + trimmed query | TTL, readable when stale |
 | Bookmark | item ID | durable until explicitly removed |
+| Read state | item ID | durable until explicitly toggled or cleared |
 | Setting | setting name | durable until explicitly removed |
 
 The implementation also provides:
@@ -47,15 +48,17 @@ The implementation also provides:
 - schema migrations inside an immediate transaction;
 - transactional feed/search fan-out into the item cache;
 - expiry indexes and explicit fresh-versus-stale reads;
-- persisted item counts so a cached `--limit 1` result cannot incorrectly
-  satisfy a later `--limit 30` request;
-- monotonic page completeness, so a smaller response cannot overwrite a larger
-  complete snapshot;
+- persisted covered-slot and available-item counts so a cached `--limit 1`
+  result cannot incorrectly satisfy a later `--limit 30` request and missing
+  upstream records do not compress canonical ranks;
+- freshness-aware replacement: a newer smaller prefix may replace a stale
+  larger page, while older writes cannot win and equal-or-greater coverage
+  cannot reduce the number of available items;
 - a 16 MiB limit for each serialized value;
 - WAL mode with `synchronous = NORMAL` for file-backed databases;
 - a five-second busy timeout and SQLite locking across local processes; and
 - separate `clear` and `clear_all` operations so ordinary cache maintenance
-  cannot erase bookmarks or settings.
+  cannot erase bookmarks, read state, or settings.
 
 SQLite is [serverless and zero-configuration](https://www.sqlite.org/serverless.html),
 which matters for a distributable terminal binary. Its own guidance recommends
@@ -87,7 +90,7 @@ budget. The recommended next implementation should:
 2. preserve recent expired snapshots for useful offline fallback;
 3. prune the oldest eligible feed, item, thread, and search rows only after a
    configurable logical-payload or stale-age threshold is crossed;
-4. never evict bookmarks or settings;
+4. never evict bookmarks, read state, or settings;
 5. run maintenance transactionally and idempotently;
 6. consider checkpointing or `VACUUM`/incremental vacuum separately, and only
    when measurements show that reclaiming physical space is worth its I/O; and
@@ -105,8 +108,8 @@ startup into extra writes, grows the WAL, and increases contention. Existing
 `fetched_at` and `expires_at` values provide a stable, low-write eviction order.
 
 Tests for this work should prove that recent stale fallback survives, the
-oldest eligible network rows leave first, user-owned rows survive, and repeated
-maintenance converges to the same result.
+oldest eligible network rows leave first, bookmarks/read state/settings survive,
+and repeated maintenance converges to the same result.
 
 ## Why not Redis or Valkey?
 
@@ -134,6 +137,7 @@ If `hnx` became a service, a reasonable split would be:
 Redis/Valkey (evictable)                 SQLite or another durable store
 hnx:feed:<feed>                          bookmarks
 hnx:item:<id>                            settings
+                                         read state
 hnx:thread:<id>
 hnx:search:<query-hash>
 ```

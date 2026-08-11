@@ -1,7 +1,7 @@
 //! Durable, cache-first storage backed by `SQLite`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::model::{Feed, Item, Source, StoryPage, Thread};
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 /// Conservative upper bound for one serialized cache value.
 pub const MAX_CACHE_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -47,6 +47,12 @@ pub enum CacheError {
 }
 
 pub type CacheResult<T> = Result<T, CacheError>;
+
+#[derive(Clone, Copy)]
+struct PageCounts {
+    covered: usize,
+    available: usize,
+}
 
 /// Timing information associated with a cached value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +113,7 @@ pub struct CacheStats {
     pub threads: u64,
     pub searches: u64,
     pub bookmarks: u64,
+    pub read_items: u64,
     pub settings: u64,
     pub stale_entries: u64,
     pub payload_bytes: u64,
@@ -121,7 +128,7 @@ impl CacheStats {
 
     #[must_use]
     pub const fn total_rows(self) -> u64 {
-        self.cache_entries() + self.bookmarks + self.settings
+        self.cache_entries() + self.bookmarks + self.read_items + self.settings
     }
 }
 
@@ -243,7 +250,10 @@ impl Cache {
         self.put_feed_encoded(
             page.feed,
             &payload,
-            page.items.len(),
+            PageCounts {
+                covered: page.covered_slots(),
+                available: page.items.len(),
+            },
             &item_rows,
             fetched_at,
             ttl,
@@ -302,39 +312,53 @@ impl Cache {
         ttl: Duration,
     ) -> CacheResult<CacheMetadata> {
         let payload = encode(value)?;
-        let item_count = serialized_story_count(&payload).unwrap_or(0);
-        self.put_feed_encoded(feed, &payload, item_count, &[], fetched_at, ttl)
+        let counts = serialized_story_counts(&payload).unwrap_or(PageCounts {
+            covered: 0,
+            available: 0,
+        });
+        self.put_feed_encoded(feed, &payload, counts, &[], fetched_at, ttl)
     }
 
     fn put_feed_encoded(
         &self,
         feed: Feed,
         payload: &[u8],
-        item_count: usize,
+        counts: PageCounts,
         item_rows: &[(i64, Vec<u8>)],
         fetched_at: i64,
         ttl: Duration,
     ) -> CacheResult<CacheMetadata> {
         let metadata = metadata_for_write(fetched_at, ttl);
-        let item_count = sqlite_count(item_count);
+        let item_count = sqlite_count(counts.covered);
+        let available_count = sqlite_count(counts.available);
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_item_rows(&transaction, item_rows, metadata)?;
         transaction.execute(
-            "INSERT INTO feeds (feed, payload, fetched_at, expires_at, item_count)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO feeds (feed, payload, fetched_at, expires_at, item_count, available_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(feed) DO UPDATE SET
                  payload = excluded.payload,
                  fetched_at = excluded.fetched_at,
                  expires_at = excluded.expires_at,
-                 item_count = excluded.item_count
-             WHERE excluded.item_count >= feeds.item_count",
+                 item_count = excluded.item_count,
+                 available_count = excluded.available_count
+             WHERE (excluded.fetched_at > feeds.fetched_at
+                       AND (excluded.item_count < feeds.item_count
+                            OR (excluded.item_count >= feeds.item_count
+                                AND excluded.available_count >= feeds.available_count)))
+                OR (excluded.fetched_at = feeds.fetched_at
+                       AND ((excluded.item_count > feeds.item_count
+                             AND excluded.available_count >= feeds.available_count)
+                            OR (excluded.item_count = feeds.item_count
+                                AND excluded.available_count >= feeds.available_count)))",
             params![
                 feed.as_str(),
                 payload,
                 metadata.fetched_at,
                 metadata.expires_at,
                 item_count,
+                available_count,
             ],
         )?;
         let persisted = transaction.query_row(
@@ -509,7 +533,10 @@ impl Cache {
         self.put_search_encoded(
             query,
             &payload,
-            page.items.len(),
+            PageCounts {
+                covered: page.covered_slots(),
+                available: page.items.len(),
+            },
             &item_rows,
             fetched_at,
             ttl,
@@ -565,39 +592,53 @@ impl Cache {
     ) -> CacheResult<CacheMetadata> {
         let query = validate_key(query, MAX_SEARCH_KEY_BYTES, "search query")?;
         let payload = encode(value)?;
-        let item_count = serialized_story_count(&payload).unwrap_or(0);
-        self.put_search_encoded(query, &payload, item_count, &[], fetched_at, ttl)
+        let counts = serialized_story_counts(&payload).unwrap_or(PageCounts {
+            covered: 0,
+            available: 0,
+        });
+        self.put_search_encoded(query, &payload, counts, &[], fetched_at, ttl)
     }
 
     fn put_search_encoded(
         &self,
         query: &str,
         payload: &[u8],
-        item_count: usize,
+        counts: PageCounts,
         item_rows: &[(i64, Vec<u8>)],
         fetched_at: i64,
         ttl: Duration,
     ) -> CacheResult<CacheMetadata> {
         let metadata = metadata_for_write(fetched_at, ttl);
-        let item_count = sqlite_count(item_count);
+        let item_count = sqlite_count(counts.covered);
+        let available_count = sqlite_count(counts.available);
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_item_rows(&transaction, item_rows, metadata)?;
         transaction.execute(
-            "INSERT INTO searches (query, payload, fetched_at, expires_at, item_count)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO searches (query, payload, fetched_at, expires_at, item_count, available_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(query) DO UPDATE SET
                  payload = excluded.payload,
                  fetched_at = excluded.fetched_at,
                  expires_at = excluded.expires_at,
-                 item_count = excluded.item_count
-             WHERE excluded.item_count >= searches.item_count",
+                 item_count = excluded.item_count,
+                 available_count = excluded.available_count
+             WHERE (excluded.fetched_at > searches.fetched_at
+                       AND (excluded.item_count < searches.item_count
+                            OR (excluded.item_count >= searches.item_count
+                                AND excluded.available_count >= searches.available_count)))
+                OR (excluded.fetched_at = searches.fetched_at
+                       AND ((excluded.item_count > searches.item_count
+                             AND excluded.available_count >= searches.available_count)
+                            OR (excluded.item_count = searches.item_count
+                                AND excluded.available_count >= searches.available_count)))",
             params![
                 query,
                 payload,
                 metadata.fetched_at,
                 metadata.expires_at,
                 item_count,
+                available_count,
             ],
         )?;
         let persisted = transaction.query_row(
@@ -639,7 +680,9 @@ impl Cache {
     }
 
     pub fn add_bookmark_at(&self, item: &Item, bookmarked_at: i64) -> CacheResult<()> {
-        let payload = encode(item)?;
+        let mut canonical = item.clone();
+        canonical.rank = None;
+        let payload = encode(&canonical)?;
         self.lock()?.execute(
             "INSERT INTO bookmarks (item_id, payload, bookmarked_at)
              VALUES (?1, ?2, ?3)
@@ -675,6 +718,36 @@ impl Cache {
             .iter()
             .map(|payload| serde_json::from_slice(payload).map_err(CacheError::from))
             .collect()
+    }
+
+    /// Marks one story as read. Per-item rows make concurrent UI sessions
+    /// independent instead of replacing one shared serialized set.
+    pub fn set_read(&self, id: u64) -> CacheResult<()> {
+        self.lock()?.execute(
+            "INSERT INTO read_items (item_id, read_at) VALUES (?1, ?2)
+             ON CONFLICT(item_id) DO UPDATE SET read_at = excluded.read_at",
+            params![sqlite_id(id)?, current_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_read(&self, id: u64) -> CacheResult<bool> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM read_items WHERE item_id = ?1",
+            [sqlite_id(id)?],
+        )? > 0)
+    }
+
+    pub fn read_items(&self) -> CacheResult<Vec<u64>> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare("SELECT item_id FROM read_items ORDER BY read_at, item_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.map(|row| {
+            let id = row?;
+            u64::try_from(id).map_err(|_| CacheError::InvalidItemId(u64::MAX))
+        })
+        .collect()
     }
 
     /// Writes an application setting as an opaque UTF-8 value.
@@ -742,6 +815,7 @@ impl Cache {
             threads: count_rows(&connection, "threads")?,
             searches: count_rows(&connection, "searches")?,
             bookmarks: count_rows(&connection, "bookmarks")?,
+            read_items: count_rows(&connection, "read_items")?,
             settings: count_rows(&connection, "settings")?,
             stale_entries: 0,
             payload_bytes: 0,
@@ -775,7 +849,7 @@ impl Cache {
 
     /// Deletes expired feed, item, thread, and search rows.
     ///
-    /// Bookmarks and settings are deliberately not affected.
+    /// Bookmarks, read state, and settings are deliberately not affected.
     pub fn prune(&self) -> CacheResult<PruneStats> {
         self.prune_expired_at(current_timestamp())
     }
@@ -805,7 +879,7 @@ impl Cache {
         Ok(stats)
     }
 
-    /// Clears cached network data, bookmarks, and settings.
+    /// Clears cached network data, bookmarks, read state, and settings.
     ///
     /// This intentionally destructive variant is named separately so the
     /// ordinary `clear` operation cannot erase user-owned state.
@@ -814,9 +888,10 @@ impl Cache {
         let transaction = connection.transaction()?;
         let cache_rows = clear_cache_tables(&transaction)?.total();
         let bookmarks = transaction.execute("DELETE FROM bookmarks", [])?;
+        let read_items = transaction.execute("DELETE FROM read_items", [])?;
         let settings = transaction.execute("DELETE FROM settings", [])?;
         transaction.commit()?;
-        Ok(cache_rows + bookmarks + settings)
+        Ok(cache_rows + bookmarks + read_items + settings)
     }
 
     fn read_entry<T: DeserializeOwned, P: rusqlite::Params>(
@@ -851,6 +926,7 @@ impl Cache {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn migrate_connection(connection: &mut Connection) -> CacheResult<()> {
     // Acquire the database write lock before reading the version. This makes
     // first-open migration safe when multiple processes start concurrently.
@@ -940,7 +1016,76 @@ fn migrate_connection(connection: &mut Connection) -> CacheResult<()> {
         transaction.execute_batch("PRAGMA user_version = 3;")?;
     }
 
+    if version < 4 {
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (
+                 key TEXT PRIMARY KEY NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS read_items (
+                 item_id INTEGER PRIMARY KEY NOT NULL CHECK(item_id >= 0),
+                 read_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS read_items_order_idx
+                 ON read_items(read_at, item_id);",
+        )?;
+        migrate_legacy_read_setting(&transaction)?;
+        record_migration(&transaction, 4)?;
+        transaction.execute_batch("PRAGMA user_version = 4;")?;
+    }
+
+    if version < 5 {
+        transaction.execute_batch(
+            "ALTER TABLE feeds
+                 ADD COLUMN available_count INTEGER NOT NULL DEFAULT 0 CHECK(available_count >= 0);
+             ALTER TABLE searches
+                 ADD COLUMN available_count INTEGER NOT NULL DEFAULT 0 CHECK(available_count >= 0);",
+        )?;
+        backfill_available_counts(&transaction)?;
+        // Early builds of this branch created schema v4 before the legacy
+        // read-setting import was added. Re-running the idempotent import here
+        // repairs those databases while v5 is still the shipping migration.
+        migrate_legacy_read_setting(&transaction)?;
+        record_migration(&transaction, 5)?;
+        transaction.execute_batch("PRAGMA user_version = 5;")?;
+    }
+
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_legacy_read_setting(transaction: &Transaction<'_>) -> CacheResult<()> {
+    let legacy = transaction
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'read.v1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(legacy) = legacy else {
+        return Ok(());
+    };
+    let Ok(ids) = serde_json::from_str::<BTreeSet<u64>>(&legacy) else {
+        // Preserve corrupt legacy data for manual recovery instead of making
+        // cache migration prevent the application from starting.
+        return Ok(());
+    };
+    let read_at = current_timestamp();
+    let mut fully_imported = true;
+    for id in ids {
+        let Ok(id) = sqlite_id(id) else {
+            fully_imported = false;
+            continue;
+        };
+        transaction.execute(
+            "INSERT OR IGNORE INTO read_items (item_id, read_at) VALUES (?1, ?2)",
+            params![id, read_at],
+        )?;
+    }
+    if fully_imported {
+        transaction.execute("DELETE FROM settings WHERE key = 'read.v1'", [])?;
+    }
     Ok(())
 }
 
@@ -949,7 +1094,10 @@ fn backfill_page_counts(transaction: &Transaction<'_>) -> CacheResult<()> {
         let mut statement = transaction.prepare("SELECT feed, payload FROM feeds")?;
         let rows = statement.query_map([], |row| {
             let payload = row.get::<_, Vec<u8>>(1)?;
-            Ok((row.get::<_, String>(0)?, serialized_story_count(&payload)))
+            Ok((
+                row.get::<_, String>(0)?,
+                serialized_story_counts(&payload).map(|counts| counts.covered),
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
@@ -966,7 +1114,10 @@ fn backfill_page_counts(transaction: &Transaction<'_>) -> CacheResult<()> {
         let mut statement = transaction.prepare("SELECT query, payload FROM searches")?;
         let rows = statement.query_map([], |row| {
             let payload = row.get::<_, Vec<u8>>(1)?;
-            Ok((row.get::<_, String>(0)?, serialized_story_count(&payload)))
+            Ok((
+                row.get::<_, String>(0)?,
+                serialized_story_counts(&payload).map(|counts| counts.covered),
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
@@ -976,6 +1127,30 @@ fn backfill_page_counts(transaction: &Transaction<'_>) -> CacheResult<()> {
                 "UPDATE searches SET item_count = ?1 WHERE query = ?2",
                 params![sqlite_count(item_count), query],
             )?;
+        }
+    }
+    Ok(())
+}
+
+fn backfill_available_counts(transaction: &Transaction<'_>) -> CacheResult<()> {
+    for (table, key) in [("feeds", "feed"), ("searches", "query")] {
+        let select = format!("SELECT {key}, payload FROM {table}");
+        let rows = {
+            let mut statement = transaction.prepare(&select)?;
+            let rows = statement.query_map([], |row| {
+                let payload = row.get::<_, Vec<u8>>(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serialized_story_counts(&payload).map(|counts| counts.available),
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let update = format!("UPDATE {table} SET available_count = ?1 WHERE {key} = ?2");
+        for (row_key, available_count) in rows {
+            if let Some(available_count) = available_count {
+                transaction.execute(&update, params![sqlite_count(available_count), row_key])?;
+            }
         }
     }
     Ok(())
@@ -1007,6 +1182,7 @@ fn count_rows(connection: &Connection, table: &str) -> CacheResult<u64> {
         "threads" => "SELECT COUNT(*) FROM threads",
         "searches" => "SELECT COUNT(*) FROM searches",
         "bookmarks" => "SELECT COUNT(*) FROM bookmarks",
+        "read_items" => "SELECT COUNT(*) FROM read_items",
         "settings" => "SELECT COUNT(*) FROM settings",
         _ => return Err(CacheError::InvalidKey("unknown cache table")),
     };
@@ -1043,10 +1219,13 @@ fn metadata_from_values(
     }
 }
 
-fn serialized_story_count(payload: &[u8]) -> Option<usize> {
+fn serialized_story_counts(payload: &[u8]) -> Option<PageCounts> {
     serde_json::from_slice::<StoryPage>(payload)
         .ok()
-        .map(|page| page.items.len())
+        .map(|page| PageCounts {
+            covered: page.covered_slots(),
+            available: page.items.len(),
+        })
 }
 
 fn sqlite_count(count: usize) -> i64 {
@@ -1056,7 +1235,11 @@ fn sqlite_count(count: usize) -> i64 {
 fn encode_item_rows(items: &[Item]) -> CacheResult<Vec<(i64, Vec<u8>)>> {
     items
         .iter()
-        .map(|item| Ok((sqlite_id(item.id)?, encode(item)?)))
+        .map(|item| {
+            let mut canonical = item.clone();
+            canonical.rank = None;
+            Ok((sqlite_id(item.id)?, encode(&canonical)?))
+        })
         .collect()
 }
 
@@ -1160,6 +1343,7 @@ mod tests {
             items: (1..=u64::try_from(count).expect("test count fits u64"))
                 .map(item)
                 .collect(),
+            slot_count: count,
             source: Source::Firebase,
             stale: false,
             fetched_at,
@@ -1198,7 +1382,27 @@ mod tests {
     }
 
     #[test]
-    fn smaller_feed_and_search_puts_do_not_replace_larger_pages() {
+    fn ranked_prefix_coverage_survives_an_unreadable_final_slot() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let mut ranked = page(Feed::Top, 59, current_timestamp());
+        ranked.slot_count = 60;
+        for (index, item) in ranked.items.iter_mut().enumerate() {
+            item.rank = Some(index + 1);
+        }
+
+        cache
+            .put_feed(&ranked, Duration::from_secs(60))
+            .expect("ranked page stores");
+        let cached = cache
+            .get_feed_for_limit(Feed::Top, 60)
+            .expect("ranked page reads")
+            .expect("sixty upstream slots are covered");
+        assert_eq!(cached.metadata.item_count, Some(60));
+        assert_eq!(cached.value.items.len(), 59);
+    }
+
+    #[test]
+    fn newer_smaller_feed_and_search_puts_replace_stale_larger_pages() {
         let cache = Cache::open_in_memory().expect("cache opens");
         let now = current_timestamp();
         let large = page(Feed::Top, 30, now);
@@ -1208,64 +1412,130 @@ mod tests {
         cache
             .put_feed(&large, Duration::from_secs(60))
             .expect("large feed stores");
-        let retained_feed_metadata = cache
+        let replaced_feed_metadata = cache
             .put_feed(&small, Duration::from_secs(120))
-            .expect("smaller feed put is safely ignored");
-        let retained_feed = cache
-            .get_feed_for_limit(Feed::Top, 30)
+            .expect("newer smaller feed replaces");
+        assert!(
+            cache
+                .get_feed_for_limit(Feed::Top, 30)
+                .expect("feed reads")
+                .is_none()
+        );
+        let replaced_feed = cache
+            .get_feed_for_limit(Feed::Top, 1)
             .expect("feed reads")
-            .expect("large feed remains");
-        assert_eq!(retained_feed.value.items.len(), 30);
-        assert_eq!(retained_feed_metadata.fetched_at, now);
-        assert_eq!(retained_feed_metadata.item_count, Some(30));
+            .expect("small feed remains");
+        assert_eq!(replaced_feed.value.items.len(), 1);
+        assert_eq!(replaced_feed_metadata.fetched_at, now + 1);
+        assert_eq!(replaced_feed_metadata.item_count, Some(1));
+        let still_newer = cache
+            .put_feed(&large, Duration::from_secs(60))
+            .expect("older completion is ignored");
+        assert_eq!(still_newer.fetched_at, now + 1);
+        assert_eq!(still_newer.item_count, Some(1));
 
         cache
             .put_search("rust", &large, Duration::from_secs(60))
             .expect("large search stores");
-        let retained_search_metadata = cache
+        let replaced_search_metadata = cache
             .put_search("rust", &small, Duration::from_secs(120))
-            .expect("smaller search put is safely ignored");
-        let retained_search = cache
-            .get_search_for_limit("rust", 30)
+            .expect("newer smaller search replaces");
+        assert!(
+            cache
+                .get_search_for_limit("rust", 30)
+                .expect("search reads")
+                .is_none()
+        );
+        let replaced_search = cache
+            .get_search_for_limit("rust", 1)
             .expect("search reads")
-            .expect("large search remains");
-        assert_eq!(retained_search.value.items.len(), 30);
-        assert_eq!(retained_search_metadata.fetched_at, now);
-        assert_eq!(retained_search_metadata.item_count, Some(30));
+            .expect("small search remains");
+        assert_eq!(replaced_search.value.items.len(), 1);
+        assert_eq!(replaced_search_metadata.fetched_at, now + 1);
+        assert_eq!(replaced_search_metadata.item_count, Some(1));
+        let still_newer = cache
+            .put_search("rust", &large, Duration::from_secs(60))
+            .expect("older search completion is ignored");
+        assert_eq!(still_newer.fetched_at, now + 1);
+        assert_eq!(still_newer.item_count, Some(1));
+    }
+
+    #[test]
+    fn transient_partial_refresh_does_not_replace_equal_coverage() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let now = current_timestamp();
+        let complete = page(Feed::Top, 30, now);
+        let mut partial = complete.clone();
+        partial.items.pop();
+        partial.fetched_at = now + 1;
+
+        cache
+            .put_feed(&complete, Duration::from_secs(60))
+            .expect("complete feed stores");
+        let retained = cache
+            .put_feed(&partial, Duration::from_secs(60))
+            .expect("partial feed is evaluated");
+        assert_eq!(retained.fetched_at, now);
+        assert_eq!(
+            cache
+                .get_feed_for_limit(Feed::Top, 30)
+                .expect("feed reads")
+                .expect("complete feed remains")
+                .value
+                .items
+                .len(),
+            30
+        );
+
+        cache
+            .put_search("rust", &complete, Duration::from_secs(60))
+            .expect("complete search stores");
+        let retained = cache
+            .put_search("rust", &partial, Duration::from_secs(60))
+            .expect("partial search is evaluated");
+        assert_eq!(retained.fetched_at, now);
+
+        let mut sparse = page(Feed::Top, 1, now + 2);
+        sparse.slot_count = 500;
+        sparse.items[0].rank = Some(500);
+        let retained = cache
+            .put_feed(&sparse, Duration::from_secs(60))
+            .expect("sparse larger prefix is evaluated");
+        assert_eq!(retained.fetched_at, now);
+        assert_eq!(retained.item_count, Some(30));
     }
 
     #[test]
     fn feed_and_search_puts_populate_the_item_cache() {
         let cache = Cache::open_in_memory().expect("cache opens");
         let now = current_timestamp();
+        let mut ranked_feed = page(Feed::Show, 3, now);
+        ranked_feed.items[1].rank = Some(2);
         cache
-            .put_feed(&page(Feed::Show, 3, now), Duration::from_secs(60))
+            .put_feed(&ranked_feed, Duration::from_secs(60))
             .expect("feed stores");
-        assert_eq!(
-            cache
-                .get_item(2)
-                .expect("contained feed item reads")
-                .expect("contained feed item exists")
-                .value
-                .id,
-            2
-        );
+        let shared_item = cache
+            .get_item(2)
+            .expect("contained feed item reads")
+            .expect("contained feed item exists")
+            .value;
+        assert_eq!(shared_item.id, 2);
+        assert_eq!(shared_item.rank, None);
 
         let mut search_page = page(Feed::Top, 1, now);
         search_page.query = Some("cached".to_owned());
         search_page.items[0] = item(99);
+        search_page.items[0].rank = Some(1);
         cache
             .put_search("cached", &search_page, Duration::from_secs(60))
             .expect("search stores");
-        assert_eq!(
-            cache
-                .get_item(99)
-                .expect("contained search item reads")
-                .expect("contained search item exists")
-                .value
-                .id,
-            99
-        );
+        let shared_item = cache
+            .get_item(99)
+            .expect("contained search item reads")
+            .expect("contained search item exists")
+            .value;
+        assert_eq!(shared_item.id, 99);
+        assert_eq!(shared_item.rank, None);
     }
 
     #[test]
@@ -1339,7 +1609,7 @@ mod tests {
         drop(connection);
 
         let cache = Cache::open(&path).expect("legacy database migrates");
-        assert_eq!(cache.schema_version().expect("version reads"), 3);
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
         assert_eq!(
             cache
                 .get_feed(Feed::Best)
@@ -1361,6 +1631,159 @@ mod tests {
     }
 
     #[test]
+    fn version_three_migration_imports_legacy_read_state() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("v3.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE feeds (
+                     feed TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE searches (
+                     query TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO settings (key, value, updated_at)
+                     VALUES ('read.v1', '[42,99]', 1);
+                 PRAGMA user_version = 3;",
+            )
+            .expect("legacy schema creates");
+        drop(connection);
+
+        let cache = Cache::open(&path).expect("legacy database migrates");
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
+        assert_eq!(
+            cache.read_items().expect("read state imports"),
+            vec![42, 99]
+        );
+        assert_eq!(
+            cache.get_setting("read.v1").expect("legacy setting checks"),
+            None
+        );
+    }
+
+    #[test]
+    fn version_four_migration_repairs_legacy_read_state() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("v4.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE feeds (
+                     feed TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE searches (
+                     query TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE read_items (
+                     item_id INTEGER PRIMARY KEY NOT NULL,
+                     read_at INTEGER NOT NULL
+                 );
+                 INSERT INTO settings (key, value, updated_at)
+                     VALUES ('read.v1', '[42,99]', 1);
+                 PRAGMA user_version = 4;",
+            )
+            .expect("legacy schema creates");
+        drop(connection);
+
+        let cache = Cache::open(&path).expect("legacy database migrates");
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
+        assert_eq!(
+            cache.read_items().expect("read state imports"),
+            vec![42, 99]
+        );
+        assert_eq!(
+            cache.get_setting("read.v1").expect("legacy setting checks"),
+            None
+        );
+    }
+
+    #[test]
+    fn version_four_migration_preserves_unsupported_legacy_read_ids() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("v4-out-of-range.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database opens");
+        let legacy = "[42,18446744073709551615]";
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE feeds (
+                     feed TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE searches (
+                     query TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE read_items (
+                     item_id INTEGER PRIMARY KEY NOT NULL,
+                     read_at INTEGER NOT NULL
+                 );
+                 INSERT INTO settings (key, value, updated_at)
+                     VALUES ('read.v1', '[42,18446744073709551615]', 1);
+                 PRAGMA user_version = 4;",
+            )
+            .expect("legacy schema creates");
+        drop(connection);
+
+        let cache = Cache::open(&path).expect("legacy database migrates");
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
+        assert_eq!(cache.read_items().expect("valid state imports"), vec![42]);
+        assert_eq!(
+            cache.get_setting("read.v1").expect("legacy setting checks"),
+            Some(legacy.to_owned())
+        );
+    }
+
+    #[test]
     fn migrates_and_round_trips_all_persistent_kinds() {
         let cache = Cache::open_in_memory().expect("cache opens");
         assert_eq!(
@@ -1373,6 +1796,7 @@ mod tests {
             .put_item(&story, Duration::from_secs(60))
             .expect("item stores");
         cache.add_bookmark(&story).expect("bookmark stores");
+        cache.set_read(story.id).expect("read state stores");
         cache
             .set_setting("theme", "midnight")
             .expect("setting stores");
@@ -1382,6 +1806,7 @@ mod tests {
             story
         );
         assert!(cache.is_bookmarked(42).expect("bookmark checks"));
+        assert_eq!(cache.read_items().expect("read state reads"), vec![42]);
         assert_eq!(cache.bookmarks().expect("bookmarks read"), vec![story]);
         assert_eq!(
             cache
@@ -1417,6 +1842,7 @@ mod tests {
             .put_item(&story, Duration::from_secs(60))
             .expect("item stores");
         cache.add_bookmark(&story).expect("bookmark stores");
+        cache.set_read(story.id).expect("read state stores");
         cache
             .set_setting("theme", "classic")
             .expect("setting stores");
@@ -1425,7 +1851,26 @@ mod tests {
         let stats = cache.stats().expect("stats read");
         assert_eq!(stats.cache_entries(), 0);
         assert_eq!(stats.bookmarks, 1);
+        assert_eq!(stats.read_items, 1);
         assert_eq!(stats.settings, 1);
+    }
+
+    #[test]
+    fn concurrent_handles_do_not_replace_unrelated_read_items() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("shared.sqlite3");
+        let first = Cache::open(&path).expect("first cache opens");
+        let second = Cache::open(&path).expect("second cache opens");
+
+        first.set_read(1).expect("first process marks read");
+        second.set_read(2).expect("second process marks read");
+        assert_eq!(
+            first.read_items().expect("combined state reads"),
+            vec![1, 2]
+        );
+
+        second.remove_read(2).expect("second process marks unread");
+        assert_eq!(first.read_items().expect("remaining state reads"), vec![1]);
     }
 
     #[test]

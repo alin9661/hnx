@@ -372,17 +372,25 @@ impl HybridClient {
         }
 
         let response: AlgoliaSearchResponse = self.get_json(url).await?;
+        let slot_count = response.hits.len().min(limit);
         let items = response
             .hits
             .into_iter()
-            .filter_map(AlgoliaHit::into_item)
             .take(limit)
+            .enumerate()
+            .filter_map(|(index, hit)| {
+                hit.into_item().map(|mut item| {
+                    item.rank = Some(index.saturating_add(1));
+                    item
+                })
+            })
             .collect();
 
         Ok(StoryPage {
             feed: Feed::Top,
             query: Some(query.to_owned()),
             items,
+            slot_count,
             source: Source::Algolia,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -398,11 +406,18 @@ impl HybridClient {
         }
 
         let response: AlgoliaSearchResponse = self.get_json(url).await?;
+        let slot_count = response.hits.len().min(limit);
         let items: Vec<_> = response
             .hits
             .into_iter()
-            .filter_map(AlgoliaHit::into_item)
             .take(limit)
+            .enumerate()
+            .filter_map(|(index, hit)| {
+                hit.into_item().map(|mut item| {
+                    item.rank = Some(index.saturating_add(1));
+                    item
+                })
+            })
             .collect();
         if items.is_empty() {
             return Err(ApiError::InvalidResponse(
@@ -414,6 +429,7 @@ impl HybridClient {
             feed: Feed::Top,
             query: None,
             items,
+            slot_count,
             source: Source::Algolia,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -443,6 +459,7 @@ impl HybridClient {
     }
 
     async fn reconcile_top(&self, algolia_page: StoryPage, ids: Vec<u64>) -> ApiResult<StoryPage> {
+        let slot_count = ids.len();
         let mut algolia_by_id = HashMap::with_capacity(algolia_page.items.len());
         for item in algolia_page.items {
             algolia_by_id.entry(item.id).or_insert(item);
@@ -462,10 +479,15 @@ impl HybridClient {
 
         let items: Vec<_> = ids
             .into_iter()
-            .filter_map(|id| {
+            .enumerate()
+            .filter_map(|(index, id)| {
                 algolia_by_id
                     .remove(&id)
                     .or_else(|| firebase_by_id.remove(&id))
+                    .map(|mut item| {
+                        item.rank = Some(index.saturating_add(1));
+                        item
+                    })
             })
             .collect();
         if items.is_empty() {
@@ -478,6 +500,7 @@ impl HybridClient {
             feed: Feed::Top,
             query: None,
             items,
+            slot_count,
             source: Source::Hybrid,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -502,7 +525,16 @@ impl HybridClient {
         ids: Vec<u64>,
         limit: usize,
     ) -> ApiResult<StoryPage> {
-        let items = self.firebase_items_in_order(ids).await;
+        let slot_count = ids.len();
+        let ranks: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index.saturating_add(1)))
+            .collect();
+        let mut items = self.firebase_items_in_order(ids).await;
+        for item in &mut items {
+            item.rank = ranks.get(&item.id).copied();
+        }
         if items.is_empty() && limit > 0 {
             return Err(ApiError::InvalidResponse(format!(
                 "Firebase returned no readable items for the {feed} feed"
@@ -513,6 +545,7 @@ impl HybridClient {
             feed,
             query: None,
             items,
+            slot_count,
             source: Source::Firebase,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -926,6 +959,7 @@ fn empty_page(feed: Feed, source: Source) -> StoryPage {
         feed,
         query: None,
         items: Vec::new(),
+        slot_count: 0,
         source,
         stale: false,
         fetched_at: unix_timestamp(),
@@ -985,6 +1019,7 @@ impl AlgoliaHit {
 
         Some(Item {
             id,
+            rank: None,
             by: nonempty(self.author),
             title: nonempty(self.title.or(self.story_title)),
             url: nonempty(self.url.or(self.story_url)),
@@ -1068,6 +1103,7 @@ impl AlgoliaItem {
             .collect();
         let item = Item {
             id,
+            rank: None,
             by: nonempty(author),
             title: nonempty(title),
             url: nonempty(url),
@@ -1176,6 +1212,7 @@ impl FirebaseItem {
     fn into_item(self) -> Item {
         Item {
             id: self.id,
+            rank: None,
             by: nonempty(self.by),
             title: nonempty(self.title),
             url: nonempty(self.url),
@@ -1349,6 +1386,10 @@ mod tests {
             page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![9, 4]
         );
+        assert_eq!(
+            page.items.iter().map(|item| item.rank).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
     }
 
     #[tokio::test]
@@ -1464,6 +1505,10 @@ mod tests {
         assert_eq!(
             page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![1, 2, 3]
+        );
+        assert_eq!(
+            page.items.iter().map(|item| item.rank).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
         );
         let requests = server
             .received_requests()

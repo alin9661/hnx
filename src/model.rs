@@ -135,6 +135,9 @@ impl fmt::Display for Source {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: u64,
+    /// One-based position in the upstream feed/search prefix, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +262,10 @@ pub struct StoryPage {
     pub query: Option<String>,
     #[serde(default)]
     pub items: Vec<Item>,
+    /// Number of upstream ranked slots fetched for this prefix. It can exceed
+    /// `items.len()` when one or more records were unreadable.
+    #[serde(default)]
+    pub slot_count: usize,
     pub source: Source,
     #[serde(default)]
     pub stale: bool,
@@ -275,6 +282,19 @@ impl StoryPage {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Number of upstream result slots represented by this prefix. This can be
+    /// larger than `items.len()` when an upstream record could not be decoded.
+    #[must_use]
+    pub fn covered_slots(&self) -> usize {
+        self.slot_count.max(
+            self.items
+                .iter()
+                .filter_map(|item| item.rank)
+                .max()
+                .unwrap_or(self.items.len()),
+        )
     }
 }
 

@@ -2,6 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hnx::{
     app::App,
+    layout::{LayoutPreferences, PaneMode},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
     theme::Theme,
     ui,
@@ -23,6 +24,7 @@ fn large_thread_app() -> App {
         feed: Feed::Top,
         query: None,
         items: vec![item.clone()],
+        slot_count: 1,
         source: Source::Cache,
         stale: false,
         fetched_at: 1,
@@ -53,23 +55,33 @@ fn large_thread_app() -> App {
 fn render_large_thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("rendering");
     group.sample_size(100);
-    group.bench_function("key_to_frame_10k_comments_120x40", |bencher| {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).expect("test terminal initializes");
-        let mut app = large_thread_app();
-        let theme = Theme::classic();
-        let mut move_up = true;
+    for (name, width, mode) in [
+        ("two_pane_10k_comments_120x40", 120, PaneMode::Two),
+        ("three_pane_10k_comments_160x40", 160, PaneMode::Three),
+    ] {
+        group.bench_function(name, |bencher| {
+            let backend = TestBackend::new(width, 40);
+            let mut terminal = Terminal::new(backend).expect("test terminal initializes");
+            let mut app = large_thread_app();
+            app.configure_layout(
+                LayoutPreferences::default().with_mode(mode),
+                LayoutPreferences::default(),
+            )
+            .expect("benchmark layout validates");
+            let theme = Theme::classic();
+            let mut move_up = true;
 
-        bencher.iter(|| {
-            let code = if move_up { KeyCode::Up } else { KeyCode::Down };
-            move_up = !move_up;
-            let _ = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
-            terminal
-                .draw(|frame| ui::render(frame, &mut app, &theme))
-                .expect("test frame renders");
-            std::hint::black_box(terminal.backend().buffer().cell((0, 0)));
+            bencher.iter(|| {
+                let code = if move_up { KeyCode::Up } else { KeyCode::Down };
+                move_up = !move_up;
+                let _ = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                terminal
+                    .draw(|frame| ui::render(frame, &mut app, &theme))
+                    .expect("test frame renders");
+                std::hint::black_box(terminal.backend().buffer().cell((0, 0)));
+            });
         });
-    });
+    }
     group.finish();
 }
 

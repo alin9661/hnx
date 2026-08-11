@@ -83,17 +83,17 @@ impl Theme {
         Self {
             name: "classic".to_owned(),
             background: Color::Rgb(247, 246, 240),
-            foreground: Color::Rgb(20, 20, 20),
+            foreground: Color::Rgb(0, 0, 0),
             muted: Color::Rgb(112, 112, 106),
             accent: Color::Rgb(255, 102, 0),
-            accent_fg: Color::Black,
+            accent_fg: Color::Rgb(0, 0, 0),
             highlight: Color::Rgb(196, 72, 0),
             success: Color::Rgb(26, 127, 55),
             warning: Color::Rgb(158, 92, 0),
             error: Color::Rgb(190, 35, 35),
             border: Color::Rgb(183, 183, 174),
-            selected_fg: Color::Black,
-            selected_bg: Color::Rgb(255, 102, 0),
+            selected_fg: Color::Rgb(0, 0, 0),
+            selected_bg: Color::Rgb(229, 228, 222),
             link: Color::Rgb(26, 82, 160),
         }
     }
@@ -248,6 +248,11 @@ impl Theme {
     }
 
     #[must_use]
+    pub fn primary_style(&self) -> Style {
+        self.base_style().add_modifier(Modifier::BOLD)
+    }
+
+    #[must_use]
     pub fn muted_style(&self) -> Style {
         self.base_style().fg(self.muted).add_modifier(Modifier::DIM)
     }
@@ -272,6 +277,19 @@ impl Theme {
         self.base_style()
             .fg(self.link)
             .add_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Uses semantic palette roles for nested-comment rails.
+    #[must_use]
+    pub fn depth_style(&self, depth: usize) -> Style {
+        let color = match depth % 5 {
+            0 => self.accent,
+            1 => self.link,
+            2 => self.success,
+            3 => self.warning,
+            _ => self.muted,
+        };
+        self.base_style().fg(color)
     }
 
     #[must_use]
@@ -369,14 +387,21 @@ mod tests {
         assert_eq!(Theme::default(), Theme::classic());
         let classic = Theme::classic();
         assert_eq!(classic.background, Color::Rgb(247, 246, 240));
+        assert_eq!(classic.foreground, Color::Rgb(0, 0, 0));
         assert_eq!(classic.accent, Color::Rgb(255, 102, 0));
-        assert_eq!(classic.accent_fg, Color::Black);
+        assert_eq!(classic.accent_fg, Color::Rgb(0, 0, 0));
         assert_eq!(classic.highlight, Color::Rgb(196, 72, 0));
-        assert_eq!(classic.selected_fg, Color::Black);
-        assert_eq!(classic.selected_bg, Color::Rgb(255, 102, 0));
+        assert_eq!(classic.selected_fg, Color::Rgb(0, 0, 0));
+        assert_eq!(classic.selected_bg, Color::Rgb(229, 228, 222));
         assert_eq!(classic.accent_style().fg, Some(classic.highlight));
-        assert_eq!(classic.selected_style().fg, Some(Color::Black));
-        assert_eq!(classic.selected_style().bg, Some(classic.accent));
+        assert_eq!(classic.selected_style().fg, Some(Color::Rgb(0, 0, 0)));
+        assert_eq!(classic.selected_style().bg, Some(classic.selected_bg));
+        assert!(
+            classic
+                .primary_style()
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(
             Theme::named("dark").expect("theme resolves"),
             Theme::midnight()

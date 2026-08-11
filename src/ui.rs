@@ -7,48 +7,30 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     app::{App, FocusPane, SecondaryPane},
+    layout::{LayoutPreferences, PaneSet, ResolvedMode, resolve_panes},
     model::{Comment, Feed, Item},
     sanitize::{sanitize_single_line, sanitize_text},
     theme::Theme,
 };
 
-pub const WIDE_MIN_WIDTH: u16 = 120;
-pub const MEDIUM_MIN_WIDTH: u16 = 80;
-
-/// The responsive content arrangement selected for a terminal width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LayoutMode {
-    /// Story list and the active secondary pane at the wide breakpoint.
-    Wide,
-    /// Story list and the active secondary pane.
-    Medium,
-    /// Only the focused pane.
-    Narrow,
-}
-
-impl LayoutMode {
-    #[must_use]
-    pub const fn for_width(width: u16) -> Self {
-        if width >= WIDE_MIN_WIDTH {
-            Self::Wide
-        } else if width >= MEDIUM_MIN_WIDTH {
-            Self::Medium
-        } else {
-            Self::Narrow
-        }
-    }
-}
+const STORY_HIGHLIGHT: &str = " ▸";
+const STORY_HIGHLIGHT_WIDTH: u16 = 2;
+const STORY_MARKER_WIDTH: usize = 2;
 
 /// Rectangles used by the renderer. `None` means that pane is hidden at this width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UiLayout {
-    pub mode: LayoutMode,
-    pub tabs: Rect,
+    pub mode: ResolvedMode,
+    pub panes: PaneSet,
+    pub masthead: Rect,
     pub stories: Option<Rect>,
     pub thread: Option<Rect>,
     pub detail: Option<Rect>,
@@ -57,14 +39,18 @@ pub struct UiLayout {
 
 /// Computes all UI regions without rendering or mutating application state.
 #[must_use]
-pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiLayout {
-    let mode = LayoutMode::for_width(area.width);
-    let header_height = area.height.min(3);
+pub fn layout_for(
+    area: Rect,
+    preferences: &LayoutPreferences,
+    focus: FocusPane,
+    secondary: SecondaryPane,
+) -> UiLayout {
+    let header_height = area.height.min(1);
     let remaining = area.height.saturating_sub(header_height);
-    let status_height = remaining.min(2);
+    let status_height = remaining.min(1);
     let content_height = remaining.saturating_sub(status_height);
 
-    let tabs = Rect::new(area.x, area.y, area.width, header_height);
+    let masthead = Rect::new(area.x, area.y, area.width, header_height);
     let content = Rect::new(
         area.x,
         area.y.saturating_add(header_height),
@@ -80,33 +66,22 @@ pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiL
         status_height,
     );
 
-    let (stories, thread, detail) = match mode {
-        LayoutMode::Wide | LayoutMode::Medium => {
-            let [stories, secondary_area] = split_two(content, 44);
-            match secondary {
-                SecondaryPane::Thread => (Some(stories), Some(secondary_area), None),
-                SecondaryPane::Detail => (Some(stories), None, Some(secondary_area)),
-            }
-        }
-        LayoutMode::Narrow => match focus {
-            FocusPane::Stories => (Some(content), None, None),
-            FocusPane::Thread => (None, Some(content), None),
-            FocusPane::Detail => (None, None, Some(content)),
-        },
-    };
+    let resolved = resolve_panes(content, preferences, focus, secondary);
 
     UiLayout {
-        mode,
-        tabs,
-        stories,
-        thread,
-        detail,
+        mode: resolved.mode,
+        panes: resolved.panes,
+        masthead,
+        stories: resolved.stories,
+        thread: resolved.thread,
+        detail: resolved.detail,
         status,
     }
 }
 
-/// Draws the complete interface. Rendering has no clock/tick dependency; it only records the
-/// current viewport capacities so subsequent navigation can keep selections visible.
+/// Draws the complete interface. Rendering has no clock/tick dependency; it records the current
+/// pane visibility, viewport capacities, and Detail extent so subsequent navigation remains
+/// aligned with what is on screen.
 pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     let area = frame.area();
     if area.is_empty() {
@@ -118,21 +93,54 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
         area,
     );
 
-    let layout = layout_for(area, app.focus(), app.secondary_pane());
-    let story_rows = layout.stories.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(2) / 2).max(1)
+    let layout = layout_for(
+        area,
+        app.layout_preferences(),
+        app.focus(),
+        app.secondary_pane(),
+    );
+    let mut story_rows = layout.stories.map_or(1, |rect| {
+        story_capacity(
+            app,
+            rect,
+            layout.thread.is_some() || layout.detail.is_some(),
+        )
     });
-    let comment_rows = layout.thread.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(2) / 2).max(1)
+    let mut comment_rows = layout.thread.map_or(1, |rect| {
+        comment_capacity(app, rect, layout.detail.is_some())
     });
+    let story_offset = app.story_offset();
+    let comment_offset = app.comment_offset();
     app.set_viewports(story_rows, comment_rows);
+    if app.story_offset() != story_offset || app.comment_offset() != comment_offset {
+        if let Some(rect) = layout.stories {
+            story_rows = story_capacity(
+                app,
+                rect,
+                layout.thread.is_some() || layout.detail.is_some(),
+            );
+        }
+        if let Some(rect) = layout.thread {
+            comment_rows = comment_capacity(app, rect, layout.detail.is_some());
+        }
+        app.set_viewports(story_rows, comment_rows);
+    }
+    app.set_rendered_panes(layout.panes, layout.mode);
 
-    render_tabs(frame, layout.tabs, app, theme);
+    render_tabs(frame, layout.masthead, app, theme);
     if let Some(rect) = layout.stories {
-        render_stories(frame, rect, app, story_rows, theme);
+        let separator = layout.thread.is_some() || layout.detail.is_some();
+        render_stories(frame, rect, app, story_rows, separator, theme);
     }
     if let Some(rect) = layout.thread {
-        render_thread(frame, rect, app, comment_rows, theme);
+        render_thread(
+            frame,
+            rect,
+            app,
+            comment_rows,
+            layout.detail.is_some(),
+            theme,
+        );
     }
     if let Some(rect) = layout.detail {
         render_detail(frame, rect, app, theme);
@@ -146,19 +154,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     }
 }
 
-fn split_two(area: Rect, left_percent: u16) -> [Rect; 2] {
-    let left_width = area.width.saturating_mul(left_percent) / 100;
-    [
-        Rect::new(area.x, area.y, left_width, area.height),
-        Rect::new(
-            area.x.saturating_add(left_width),
-            area.y,
-            area.width.saturating_sub(left_width),
-            area.height,
-        ),
-    ]
-}
-
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -167,55 +162,122 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .iter()
         .position(|feed| *feed == app.feed())
         .unwrap_or_default();
-    let titles = Feed::ALL.map(|feed| Line::from(feed.label()));
-    let mut title = vec![Span::styled(
-        " hnx ",
-        Style::default()
-            .fg(theme.accent_fg)
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if let Some(query) = app.search_query() {
-        title.push(Span::styled(
-            format!(" · “{}” ", sanitize_single_line(query)),
-            theme.muted_style(),
-        ));
+    let masthead_style = Style::default()
+        .fg(theme.accent_fg)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let brand = " hnx ";
+    let labels: Vec<_> = Feed::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, feed)| {
+            if index == selected {
+                format!(" ◆ {} ", feed.label())
+            } else {
+                format!("   {} ", feed.label())
+            }
+        })
+        .collect();
+    let query_label = app
+        .search_query()
+        .map(|query| format!(" · “{}” ", sanitize_single_line(query)));
+    let full_width = brand.chars().count()
+        + labels
+            .iter()
+            .map(|label| label.chars().count())
+            .sum::<usize>()
+        + query_label
+            .as_ref()
+            .map_or(0, |query| Span::raw(query.as_str()).width());
+    let visible_labels: Vec<_> = if full_width <= usize::from(area.width) {
+        labels.iter().enumerate().collect()
+    } else {
+        vec![(selected, &labels[selected])]
+    };
+    let mut spans = vec![Span::styled(brand, masthead_style)];
+    for (index, label) in visible_labels {
+        let style = if index == selected {
+            masthead_style.add_modifier(Modifier::UNDERLINED)
+        } else {
+            masthead_style
+        };
+        spans.push(Span::styled(label.clone(), style));
     }
-    let tabs = Tabs::new(titles)
-        .select(selected)
-        .divider(Span::styled(" │ ", Style::default().fg(theme.border)))
-        .block(
-            Block::default()
-                .title(Line::from(title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border)),
-        )
-        .style(theme.muted_style())
-        .highlight_style(theme.selected_style().add_modifier(Modifier::BOLD));
-    frame.render_widget(tabs, area);
+    if let Some(query) = query_label {
+        spans.push(Span::styled(query, masthead_style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(masthead_style),
+        area,
+    );
 }
 
-fn render_stories(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, theme: &Theme) {
+fn render_stories(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    capacity: usize,
+    separator: bool,
+    theme: &Theme,
+) {
     if area.is_empty() {
         return;
     }
     let title = if app.bookmarks_only() {
-        format!(" Saved ({}) ", app.visible_item_count())
+        format!(
+            " Saved · page {} ({}) ",
+            app.page_index().saturating_add(1),
+            app.visible_item_count()
+        )
     } else if app.filter().is_empty() {
-        format!(" Stories ({}) ", app.visible_item_count())
+        format!(
+            " Stories · page {} ({}) ",
+            app.page_index().saturating_add(1),
+            app.visible_item_count()
+        )
     } else {
         format!(
-            " Stories ({}) · /{}/ ",
+            " Stories · page {} ({}) · /{}/ ",
+            app.page_index().saturating_add(1),
             app.visible_item_count(),
             sanitize_single_line(app.filter())
         )
     };
-    let block = pane_block(title, app.focus() == FocusPane::Stories, theme);
+    let block = pane_block(title, app.focus() == FocusPane::Stories, separator, theme);
 
     let offset = app.story_offset();
+    let selected = app.selected_story_index();
+    let rank_width = app
+        .loaded_story_slots()
+        .max(app.stories().len())
+        .max(1)
+        .to_string()
+        .len();
+    let row_width = story_row_width(area, separator);
+    let mut remaining_rows = usize::from(area.height.saturating_sub(1)).max(1);
     let items: Vec<ListItem<'_>> = app
         .visible_item_window(offset, capacity)
-        .map(|item| story_row(item, app.is_bookmarked(item.id), theme))
+        .enumerate()
+        .map(|(relative, item)| {
+            let rank = app
+                .visible_story_rank(offset.saturating_add(relative))
+                .unwrap_or_default();
+            let height = story_height(item, rank, rank_width, row_width, remaining_rows).max(1);
+            remaining_rows = remaining_rows.saturating_sub(height);
+            story_row(
+                item,
+                StoryRowContext {
+                    rank,
+                    rank_width,
+                    bookmarked: app.is_bookmarked(item.id),
+                    read: app.is_read(item.id),
+                    selected: selected == Some(offset.saturating_add(relative)),
+                    row_width,
+                    max_height: height,
+                },
+                theme,
+            )
+        })
         .collect();
 
     if items.is_empty() {
@@ -238,34 +300,79 @@ fn render_stories(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize,
         return;
     }
 
-    let selected = app
-        .selected_story_index()
+    let selected = selected
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < items.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = if app.focus() == FocusPane::Stories {
-        theme.selected_style()
-    } else {
-        theme.muted_style().add_modifier(Modifier::BOLD)
-    };
+    let highlight_style = Style::default().bg(theme.selected_bg);
     let list = List::new(items)
         .block(block)
-        .highlight_symbol("▸ ")
+        .highlight_symbol(STORY_HIGHLIGHT)
+        .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(highlight_style);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> {
-    let marker = if bookmarked { "★ " } else { "  " };
+#[derive(Clone, Copy)]
+struct StoryRowContext {
+    rank: usize,
+    rank_width: usize,
+    bookmarked: bool,
+    read: bool,
+    selected: bool,
+    row_width: usize,
+    max_height: usize,
+}
+
+fn story_row(item: &Item, context: StoryRowContext, theme: &Theme) -> ListItem<'static> {
+    let StoryRowContext {
+        rank,
+        rank_width,
+        bookmarked,
+        read,
+        selected,
+        row_width,
+        max_height,
+    } = context;
+    let marker = match (bookmarked, read) {
+        (true, true) => "★✓",
+        (true, false) => "★ ",
+        (false, true) => "✓ ",
+        (false, false) => "  ",
+    };
     let title_style = if item.is_unavailable() {
         theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
+    } else if read && !selected {
+        theme.muted_style().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.foreground)
+        primary_style(theme, selected)
     };
-    let title = Line::from(vec![
-        Span::styled(marker, Style::default().fg(theme.warning)),
-        Span::styled(sanitize_single_line(item.display_title()), title_style),
-    ]);
+    let rank_prefix = format!("{rank:>rank_width$}. ");
+    let title_indent = " ".repeat(STORY_MARKER_WIDTH.saturating_add(rank_prefix.len()));
+    let title_width = row_width.saturating_sub(title_indent.len()).max(1);
+    let title_limit = max_height.saturating_sub(1).max(1);
+    let (mut title_lines, truncated) = wrap_text_limited(
+        &sanitize_single_line(item.display_title()),
+        title_width,
+        title_limit,
+    );
+    if truncated && let Some(last) = title_lines.last_mut() {
+        "…".clone_into(last);
+    }
+    let mut lines = Vec::with_capacity(title_lines.len().saturating_add(1));
+    if let Some(first) = title_lines.first() {
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.warning)),
+            Span::styled(rank_prefix, theme.muted_style()),
+            Span::styled(first.clone(), title_style),
+        ]));
+    }
+    lines.extend(title_lines.into_iter().skip(1).map(|title| {
+        Line::from(vec![
+            Span::raw(title_indent.clone()),
+            Span::styled(title, title_style),
+        ])
+    }));
 
     let author = sanitize_single_line(item.by.as_deref().unwrap_or("unknown"));
     let domain = sanitize_single_line(
@@ -275,21 +382,119 @@ fn story_row(item: &Item, bookmarked: bool, theme: &Theme) -> ListItem<'static> 
             .unwrap_or("news.ycombinator.com"),
     );
     let age = age(item.time);
-    let metadata = if age.is_empty() {
-        format!(
-            "  {} pts · {} comments · {author} · {domain}",
-            item.score, item.descendants
-        )
-    } else {
-        format!(
-            "  {} pts · {} comments · {author} · {age} · {domain}",
-            item.score, item.descendants
-        )
-    };
-    ListItem::new(vec![title, Line::styled(metadata, theme.muted_style())])
+    if max_height > 1 {
+        let mut metadata = vec![Span::styled(
+            format!(
+                "{title_indent}{} pts · {} comments · ",
+                item.score, item.descendants
+            ),
+            theme.muted_style(),
+        )];
+        metadata.push(Span::styled(author, primary_style(theme, selected)));
+        let suffix = if age.is_empty() {
+            format!(" · {domain}")
+        } else {
+            format!(" · {age} · {domain}")
+        };
+        metadata.push(Span::styled(suffix, theme.muted_style()));
+        lines.push(Line::from(metadata));
+    }
+    ListItem::new(lines)
 }
 
-fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, theme: &Theme) {
+fn story_capacity(app: &App, area: Rect, separator: bool) -> usize {
+    let available_rows = usize::from(area.height.saturating_sub(1)).max(1);
+    let row_width = story_row_width(area, separator);
+    let rank_width = app
+        .loaded_story_slots()
+        .max(app.stories().len())
+        .max(1)
+        .to_string()
+        .len();
+    let len = app.visible_item_count();
+    if len == 0 {
+        return 1;
+    }
+    let mut start = app.story_offset().min(len.saturating_sub(1));
+    let mut count = story_window_capacity(app, start, available_rows, row_width, rank_width);
+    while start > 0 && count == len.saturating_sub(start) {
+        let candidate = start.saturating_sub(1);
+        let candidate_count =
+            story_window_capacity(app, candidate, available_rows, row_width, rank_width);
+        if candidate_count != len.saturating_sub(candidate) {
+            break;
+        }
+        start = candidate;
+        count = candidate_count;
+    }
+    count.max(1)
+}
+
+fn story_window_capacity(
+    app: &App,
+    offset: usize,
+    available_rows: usize,
+    row_width: usize,
+    rank_width: usize,
+) -> usize {
+    let mut used = 0_usize;
+    let mut count = 0_usize;
+    for (relative, item) in app.visible_item_window(offset, usize::MAX).enumerate() {
+        let remaining = available_rows.saturating_sub(used);
+        let rank = app
+            .visible_story_rank(offset.saturating_add(relative))
+            .unwrap_or_default();
+        let height = story_height(item, rank, rank_width, row_width, remaining);
+        if count > 0 && used.saturating_add(height) > available_rows {
+            break;
+        }
+        used = used.saturating_add(height);
+        count = count.saturating_add(1);
+        if used >= available_rows {
+            break;
+        }
+    }
+    count
+}
+
+fn story_row_width(area: Rect, separator: bool) -> usize {
+    usize::from(
+        area.width
+            .saturating_sub(u16::from(separator))
+            .saturating_sub(STORY_HIGHLIGHT_WIDTH),
+    )
+    .max(1)
+}
+
+fn story_height(
+    item: &Item,
+    rank: usize,
+    rank_width: usize,
+    row_width: usize,
+    max_height: usize,
+) -> usize {
+    let prefix_width = STORY_MARKER_WIDTH.saturating_add(format!("{rank:>rank_width$}. ").len());
+    let title_width = row_width.saturating_sub(prefix_width).max(1);
+    let title_limit = max_height.saturating_sub(1).max(1);
+    let (title_lines, _) = wrap_text_limited(
+        &sanitize_single_line(item.display_title()),
+        title_width,
+        title_limit,
+    );
+    title_lines
+        .len()
+        .saturating_add(usize::from(max_height > 1))
+        .min(max_height.max(1))
+}
+
+fn render_thread(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    capacity: usize,
+    separator: bool,
+    theme: &Theme,
+) {
     if area.is_empty() {
         return;
     }
@@ -300,7 +505,7 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
     } else {
         format!(" Thread ({visible_count}/{total_count}) ")
     };
-    let block = pane_block(title, app.focus() == FocusPane::Thread, theme);
+    let block = pane_block(title, app.focus() == FocusPane::Thread, separator, theme);
     if app.thread().is_none() {
         let message = if app.loading() {
             "Loading thread…"
@@ -318,9 +523,24 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
     }
 
     let offset = app.comment_offset();
+    let selected = app.selected_comment_index();
+    let row_width = comment_row_width(area, separator);
+    let mut remaining_rows = usize::from(area.height.saturating_sub(1)).max(1);
     let comments: Vec<ListItem<'_>> = app
         .visible_comment_window(offset, capacity)
-        .map(|comment| comment_row(comment, app.is_comment_collapsed(comment.id), theme))
+        .enumerate()
+        .map(|(relative, comment)| {
+            let height = comment_height(comment, row_width, remaining_rows).max(1);
+            remaining_rows = remaining_rows.saturating_sub(height);
+            comment_row(
+                comment,
+                app.is_comment_collapsed(comment.id),
+                selected == Some(offset.saturating_add(relative)),
+                row_width,
+                height,
+                theme,
+            )
+        })
         .collect();
     if comments.is_empty() {
         frame.render_widget(
@@ -332,16 +552,11 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
         return;
     }
 
-    let selected = app
-        .selected_comment_index()
+    let selected = selected
         .and_then(|index| index.checked_sub(offset))
         .filter(|index| *index < comments.len());
     let mut state = ListState::default().with_selected(selected);
-    let highlight_style = if app.focus() == FocusPane::Thread {
-        theme.selected_style()
-    } else {
-        theme.muted_style().add_modifier(Modifier::BOLD)
-    };
+    let highlight_style = Style::default().bg(theme.selected_bg);
     let list = List::new(comments)
         .block(block)
         .highlight_symbol("▸ ")
@@ -349,9 +564,15 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, app: &App, capacity: usize, 
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'static> {
-    let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
-    let indent = "  ".repeat(depth);
+fn comment_row(
+    comment: &Comment,
+    collapsed: bool,
+    selected: bool,
+    row_width: usize,
+    max_lines: usize,
+    theme: &Theme,
+) -> ListItem<'static> {
+    let depth = comment_depth(comment, row_width);
     let fold = if collapsed {
         "▸"
     } else if comment.kids.is_empty() && comment.children.is_empty() {
@@ -365,25 +586,175 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
         sanitize_single_line(comment.by.as_deref().unwrap_or("unknown"))
     };
     let age = age(comment.time);
-    let metadata = if age.is_empty() {
-        format!("{indent}{fold} {author}")
-    } else {
-        format!("{indent}{fold} {author} · {age}")
-    };
-    let body = comment
+    let mut metadata = depth_rails(depth, theme);
+    metadata.push(Span::styled(format!("{fold} "), theme.muted_style()));
+    metadata.push(Span::styled(author, primary_style(theme, selected)));
+    if !age.is_empty() {
+        metadata.push(Span::styled(format!(" · {age}"), theme.muted_style()));
+    }
+    let body = comment_body(comment);
+    let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
+    let (mut body_lines, truncated) =
+        wrap_text_limited(&body, body_width.max(1), max_lines.saturating_sub(1));
+    if truncated && max_lines == 1 {
+        metadata.push(Span::styled(" …", theme.muted_style()));
+    } else if truncated && let Some(last) = body_lines.last_mut() {
+        "…".clone_into(last);
+    }
+    let mut lines = vec![Line::from(metadata)];
+    for body_line in body_lines {
+        lines.push(Line::from(
+            [
+                depth_rails(depth, theme),
+                vec![
+                    Span::styled("  ", theme.muted_style()),
+                    Span::styled(body_line, primary_style(theme, selected)),
+                ],
+            ]
+            .concat(),
+        ));
+    }
+    ListItem::new(lines)
+}
+
+fn comment_capacity(app: &App, area: Rect, separator: bool) -> usize {
+    let available_rows = usize::from(area.height.saturating_sub(1)).max(1);
+    let row_width = comment_row_width(area, separator);
+    let mut used = 0_usize;
+    let mut count = 0_usize;
+    for comment in app.visible_comment_window(app.comment_offset(), usize::MAX) {
+        let remaining = available_rows.saturating_sub(used);
+        let height = comment_height(comment, row_width, remaining.saturating_add(1));
+        if count > 0 && used.saturating_add(height) > available_rows {
+            break;
+        }
+        used = used.saturating_add(height);
+        count = count.saturating_add(1);
+        if used >= available_rows {
+            break;
+        }
+    }
+    count.max(1)
+}
+
+fn comment_row_width(area: Rect, separator: bool) -> usize {
+    usize::from(
+        area.width
+            .saturating_sub(u16::from(separator))
+            .saturating_sub(2),
+    )
+    .max(1)
+}
+
+fn comment_height(comment: &Comment, row_width: usize, max_height: usize) -> usize {
+    let depth = comment_depth(comment, row_width);
+    let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
+    let body_limit = max_height.saturating_sub(1);
+    let (lines, _) = wrap_text_limited(&comment_body(comment), body_width.max(1), body_limit);
+    1_usize.saturating_add(lines.len()).min(max_height.max(1))
+}
+
+fn comment_depth(comment: &Comment, row_width: usize) -> usize {
+    let semantic_depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
+    // Preserve room for a double-width grapheme at deep nesting levels.
+    semantic_depth.min(row_width.saturating_sub(4) / 2)
+}
+
+fn comment_body(comment: &Comment) -> String {
+    comment
         .text
         .as_deref()
         .map(strip_html)
         .map(|body| sanitize_single_line(&body))
         .filter(|body| !body.is_empty())
-        .unwrap_or_else(|| "[deleted]".to_owned());
-    ListItem::new(vec![
-        Line::styled(metadata, theme.accent_style()),
-        Line::styled(
-            format!("{indent}  {body}"),
-            Style::default().fg(theme.foreground),
-        ),
-    ])
+        .unwrap_or_else(|| "[deleted]".to_owned())
+}
+
+#[cfg(test)]
+fn wrap_text(input: &str, width: usize) -> Vec<String> {
+    wrap_text_limited(input, width, usize::MAX).0
+}
+
+fn wrap_text_limited(input: &str, width: usize, max_lines: usize) -> (Vec<String>, bool) {
+    if max_lines == 0 {
+        return (Vec::new(), !input.trim().is_empty());
+    }
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+
+    for word in input.split_whitespace() {
+        let word_width = Span::raw(word).width();
+        if !line.is_empty() && line_width.saturating_add(1).saturating_add(word_width) <= width {
+            line.push(' ');
+            line.push_str(word);
+            line_width = line_width.saturating_add(1).saturating_add(word_width);
+            continue;
+        }
+        if !line.is_empty() {
+            if lines.len() == max_lines {
+                return (lines, true);
+            }
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        if word_width <= width {
+            line.push_str(word);
+            line_width = word_width;
+            continue;
+        }
+        for grapheme in word.graphemes(true) {
+            let grapheme_width = Span::raw(grapheme).width();
+            if grapheme_width > width {
+                if !line.is_empty() {
+                    if lines.len() == max_lines {
+                        return (lines, true);
+                    }
+                    lines.push(std::mem::take(&mut line));
+                    line_width = 0;
+                }
+                if lines.len() == max_lines {
+                    return (lines, true);
+                }
+                lines.push("…".to_owned());
+                continue;
+            }
+            if !line.is_empty() && line_width.saturating_add(grapheme_width) > width {
+                if lines.len() == max_lines {
+                    return (lines, true);
+                }
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push_str(grapheme);
+            line_width = line_width.saturating_add(grapheme_width);
+        }
+    }
+    if !line.is_empty() {
+        if lines.len() == max_lines {
+            return (lines, true);
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    (lines, false)
+}
+
+fn primary_style(theme: &Theme, selected: bool) -> Style {
+    if selected {
+        theme.primary_style().fg(theme.selected_fg)
+    } else {
+        theme.primary_style()
+    }
+}
+
+fn depth_rails(depth: usize, theme: &Theme) -> Vec<Span<'static>> {
+    (0..depth)
+        .map(|level| Span::styled("│ ", theme.depth_style(level)))
+        .collect()
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
@@ -393,6 +764,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme
     let block = pane_block(
         " Detail / article ",
         app.focus() == FocusPane::Detail,
+        false,
         theme,
     );
     let mut lines = Vec::new();
@@ -411,7 +783,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme
         lines.extend(
             sanitize_text(&article.body)
                 .lines()
-                .map(|line| Line::raw(line.to_owned())),
+                .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
         );
     } else if let Some(comment) = app.selected_comment() {
         lines.extend(comment_detail(comment, theme));
@@ -453,7 +825,10 @@ fn comment_detail(comment: &Comment, theme: &Theme) -> Vec<Line<'static>> {
         .map(|body| sanitize_text(&body))
         .filter(|body| !body.is_empty())
         .unwrap_or_else(|| "[deleted]".to_owned());
-    lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+    lines.extend(
+        body.lines()
+            .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
+    );
     lines
 }
 
@@ -480,7 +855,10 @@ fn item_detail(item: &Item, theme: &Theme) -> Vec<Line<'static>> {
     if let Some(body) = &item.text {
         lines.push(Line::raw(""));
         let body = sanitize_text(&strip_html(body));
-        lines.extend(body.lines().map(|line| Line::raw(line.to_owned())));
+        lines.extend(
+            body.lines()
+                .map(|line| Line::styled(line.to_owned(), theme.primary_style())),
+        );
     } else {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -491,7 +869,7 @@ fn item_detail(item: &Item, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode, theme: &Theme) {
+fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMode, theme: &Theme) {
     if area.is_empty() {
         return;
     }
@@ -530,7 +908,10 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode,
         ));
     }
     if app.loading() {
-        state.push(Span::styled(" loading… ", theme.accent_style()));
+        state.push(Span::styled(
+            format!(" {} loading… ", app.loading_indicator()),
+            theme.accent_style(),
+        ));
     }
     if let Some(error) = app.error() {
         state.push(Span::styled(
@@ -544,52 +925,98 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode,
         ));
     }
 
-    let focus = format!("{} · {}", mode_label(mode), app.focus().label());
-    state.push(Span::styled(format!(" {focus} "), theme.muted_style()));
+    let hints = match (mode, area.width) {
+        (ResolvedMode::One, _) => "? help · q quit",
+        (_, 100..) => "? help · q quit · Tab pane · L layout · Alt+h/l resize · Alt+0 reset",
+        (_, 64..) => "? help · q quit · Tab pane · L layout",
+        _ => "? help · q quit",
+    };
+    let suffix = status_suffix(mode, app.focus(), hints, area.width);
+    let suffix_width = u16::try_from(suffix.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let message_width = area.width.saturating_sub(suffix_width);
+    let message_area = Rect::new(area.x, area.y, message_width, area.height);
+    let suffix_area = Rect::new(
+        area.x.saturating_add(message_width),
+        area.y,
+        suffix_width,
+        area.height,
+    );
 
-    let mut lines = vec![Line::from(state)];
-    if area.height > 1 {
-        let keys = if area.width >= WIDE_MIN_WIDTH {
-            " ? help  q quit  j/k move  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane  Enter select  a read  o open "
-        } else if area.width >= MEDIUM_MIN_WIDTH {
-            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane "
-        } else {
-            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page "
-        };
-        lines.push(Line::styled(keys, theme.muted_style()));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(Line::from(state)), message_area);
+    frame.render_widget(
+        Paragraph::new(suffix)
+            .style(theme.muted_style())
+            .alignment(Alignment::Right),
+        suffix_area,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let popup = centered_rect(area, 74, 20);
+    let popup = centered_rect(area, 74, 24);
     if popup.is_empty() {
         return;
     }
     frame.render_widget(Clear, popup);
-    let help = vec![
+    let full_help = vec![
         Line::styled("Navigation", theme.accent_style()),
         Line::raw("j/k or ↑/↓   move selection / scroll article"),
         Line::raw("h/l or ←/→   move between panes"),
         Line::raw("Tab           next pane"),
+        Line::raw("BackTab       previous pane"),
         Line::raw("Ctrl+U/D      half-page up/down"),
         Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
-        Line::raw("[/] or 1–6    switch feed"),
+        Line::raw("[/] or 1–6    switch feed · n next page · p previous page"),
+        Line::raw(""),
+        Line::styled("Layout", theme.accent_style()),
+        Line::raw("L             toggle two / three panes"),
+        Line::raw("Alt+h / Alt+l shrink / grow focused pane"),
+        Line::raw("Alt+0         restore config / built-in splits"),
         Line::raw(""),
         Line::styled("Find and save", theme.accent_style()),
         Line::raw("/             search Hacker News"),
         Line::raw("f             case-insensitive regex filter"),
         Line::raw("b / Space     toggle bookmark"),
+        Line::raw("m             toggle selected story read / unread"),
         Line::raw("B             show only bookmarks"),
         Line::raw(""),
-        Line::raw("a article · o browser · O offline · r refresh · ? close help · q quit"),
+        Line::raw("a article · o browser · O offline · r refresh · ?/q close help"),
     ];
+    let compact_help = vec![
+        Line::styled("Navigation", theme.accent_style()),
+        Line::raw("j/k move · h/l pane · Tab cycle · n next · p previous"),
+        Line::styled("Layout", theme.accent_style()),
+        Line::raw("L toggle · Alt+h/l resize · Alt+0 reset"),
+        Line::styled("Find and save", theme.accent_style()),
+        Line::raw("/ search · f filter · b save · m read/unread · B saved"),
+        Line::raw("a article · o browser · O offline · r refresh · q close"),
+    ];
+    let narrow_help = vec![
+        Line::styled("?/q/Esc close", theme.accent_style()),
+        Line::raw("Nav j/k h/l"),
+        Line::raw("Tab · Enter"),
+        Line::raw("Layout L"),
+        Line::raw("Resize Alt-h/l"),
+        Line::raw("Find / f"),
+        Line::raw("Save b B"),
+        Line::raw("Read m"),
+        Line::raw("Read a o O r"),
+        Line::raw("n next p prev"),
+    ];
+    let help = if area.width < 40 {
+        narrow_help
+    } else if area.height < 24 {
+        compact_help
+    } else {
+        full_help
+    };
     frame.render_widget(
         Paragraph::new(help)
             .block(
                 Block::default()
-                    .title(" Keyboard help ")
+                    .title(" Keyboard help · Esc/?/q close ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.highlight)),
             )
@@ -624,20 +1051,31 @@ fn render_prompt(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-fn pane_block(title: impl Into<String>, focused: bool, theme: &Theme) -> Block<'static> {
-    let border = if focused {
-        theme.highlight
+fn pane_block(
+    title: impl Into<String>,
+    focused: bool,
+    separator: bool,
+    theme: &Theme,
+) -> Block<'static> {
+    let border = if focused { theme.accent } else { theme.border };
+    let title_style = if focused {
+        theme
+            .base_style()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
-        theme.border
+        theme.primary_style()
     };
-    let mut style = Style::default().fg(border);
-    if focused {
-        style = style.add_modifier(Modifier::BOLD);
-    }
+    let title = format!("{}{}", if focused { "◆ " } else { "  " }, title.into());
+    let borders = if separator {
+        Borders::TOP | Borders::RIGHT
+    } else {
+        Borders::TOP
+    };
     Block::default()
-        .title(title.into())
-        .borders(Borders::ALL)
-        .border_style(style)
+        .title(Line::styled(title, title_style))
+        .borders(borders)
+        .border_style(Style::default().fg(border))
 }
 
 fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
@@ -655,10 +1093,30 @@ fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
     )
 }
 
-fn mode_label(mode: LayoutMode) -> &'static str {
+fn mode_label(mode: ResolvedMode) -> &'static str {
     match mode {
-        LayoutMode::Wide | LayoutMode::Medium => "2-pane",
-        LayoutMode::Narrow => "1-pane",
+        ResolvedMode::Three => "3-pane",
+        ResolvedMode::Two => "2-pane",
+        ResolvedMode::One => "1-pane",
+    }
+}
+
+fn status_suffix(mode: ResolvedMode, focus: FocusPane, hints: &str, width: u16) -> String {
+    let recovery = " ? help · q quit ";
+    let compact_recovery = " ? · q ";
+    let focus_and_recovery = format!(" {} ·{recovery}", focus.label());
+    let full = format!(" {} · {} · {hints} ", mode_label(mode), focus.label());
+    for candidate in [full, focus_and_recovery, recovery.to_owned()] {
+        if candidate.chars().count() <= usize::from(width) {
+            return candidate;
+        }
+    }
+    if compact_recovery.chars().count() <= usize::from(width) {
+        compact_recovery.to_owned()
+    } else if width > 0 {
+        "q".to_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -740,11 +1198,12 @@ fn strip_html(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Modifier};
 
-    use super::{LayoutMode, centered_rect, layout_for, render};
+    use super::{centered_rect, layout_for, render, status_suffix, wrap_text, wrap_text_limited};
     use crate::{
         app::{App, ArticleView, FocusPane, SecondaryPane},
+        layout::{LayoutPreferences, PaneMode, ResolvedMode},
         model::{Comment, Feed, Item, Source, StoryPage, Thread},
         theme::Theme,
     };
@@ -762,25 +1221,102 @@ mod tests {
                 descendants: 45,
                 ..Item::default()
             }],
+            slot_count: 1,
             source: Source::Cache,
             stale: true,
             fetched_at: 1,
         }
     }
 
+    fn find_run(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let symbols: Vec<_> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                if symbols.iter().enumerate().all(|(offset, symbol)| {
+                    u16::try_from(offset)
+                        .ok()
+                        .and_then(|offset| buffer.cell((x.saturating_add(offset), y)))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                }) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!(
+            "rendered text `{needle}` was not found in:\n{}",
+            buffer
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                })
+        );
+    }
+
+    fn find_run_on_row(buffer: &ratatui::buffer::Buffer, needle: &str, y: u16) -> u16 {
+        let symbols: Vec<_> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        (buffer.area.x..buffer.area.right())
+            .find(|x| {
+                symbols.iter().enumerate().all(|(offset, symbol)| {
+                    u16::try_from(offset)
+                        .ok()
+                        .and_then(|offset| buffer.cell((x.saturating_add(offset), y)))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                })
+            })
+            .unwrap_or_else(|| panic!("rendered text `{needle}` was not found on row {y}"))
+    }
+
+    fn cells_for<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        text: &str,
+    ) -> impl Iterator<Item = &'a ratatui::buffer::Cell> {
+        let (x, y) = find_run(buffer, text);
+        (0..text.chars().count()).map(move |offset| {
+            let offset = u16::try_from(offset).expect("test text fits terminal");
+            buffer.cell((x + offset, y)).expect("rendered cell exists")
+        })
+    }
+
     #[test]
     fn exact_width_breakpoints_choose_expected_layouts() {
-        assert_eq!(LayoutMode::for_width(120), LayoutMode::Wide);
-        assert_eq!(LayoutMode::for_width(119), LayoutMode::Medium);
-        assert_eq!(LayoutMode::for_width(80), LayoutMode::Medium);
-        assert_eq!(LayoutMode::for_width(79), LayoutMode::Narrow);
+        let preferences = LayoutPreferences::default().with_mode(PaneMode::Three);
+        assert_eq!(
+            layout_for(
+                Rect::new(0, 0, 120, 20),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Three
+        );
+        assert_eq!(
+            layout_for(
+                Rect::new(0, 0, 119, 20),
+                &preferences,
+                FocusPane::Stories,
+                SecondaryPane::Thread
+            )
+            .mode,
+            ResolvedMode::Two
+        );
     }
 
     #[test]
     fn wide_and_medium_render_stories_with_the_active_secondary_pane() {
+        let preferences = LayoutPreferences::default();
         for width in [120, 119, 80] {
             let thread = layout_for(
                 Rect::new(0, 0, width, 30),
+                &preferences,
                 FocusPane::Stories,
                 SecondaryPane::Thread,
             );
@@ -793,6 +1329,7 @@ mod tests {
 
             let detail = layout_for(
                 Rect::new(0, 0, width, 30),
+                &preferences,
                 FocusPane::Detail,
                 SecondaryPane::Detail,
             );
@@ -803,13 +1340,19 @@ mod tests {
     #[test]
     fn narrow_layout_renders_only_the_focused_pane() {
         let area = Rect::new(0, 0, 79, 30);
-        let stories = layout_for(area, FocusPane::Stories, SecondaryPane::Thread);
+        let preferences = LayoutPreferences::default();
+        let stories = layout_for(
+            area,
+            &preferences,
+            FocusPane::Stories,
+            SecondaryPane::Thread,
+        );
         assert!(stories.stories.is_some() && stories.thread.is_none() && stories.detail.is_none());
 
-        let thread = layout_for(area, FocusPane::Thread, SecondaryPane::Detail);
+        let thread = layout_for(area, &preferences, FocusPane::Thread, SecondaryPane::Detail);
         assert!(thread.stories.is_none() && thread.thread.is_some() && thread.detail.is_none());
 
-        let detail = layout_for(area, FocusPane::Detail, SecondaryPane::Thread);
+        let detail = layout_for(area, &preferences, FocusPane::Detail, SecondaryPane::Thread);
         assert!(detail.stories.is_none() && detail.thread.is_none() && detail.detail.is_some());
     }
 
@@ -855,6 +1398,175 @@ mod tests {
     }
 
     #[test]
+    fn stories_render_absolute_rank_and_persistent_read_marker() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut ranked = page();
+        ranked.items.push(Item {
+            id: 2,
+            title: Some("An unread story".to_owned()),
+            ..Item::default()
+        });
+        let mut app = App::new(ranked);
+        app.set_read_items([1, 2]);
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("ranked story renders");
+        let buffer = terminal.backend().buffer();
+        let (rank_x, rank_y) = find_run(buffer, "1.");
+        let (read_x, read_y) = find_run(buffer, "✓");
+        let (title_x, title_y) = find_run(buffer, "A carefully rendered story");
+
+        assert_eq!(rank_y, title_y);
+        assert_eq!(read_y, title_y);
+        assert!(read_x < rank_x && rank_x < title_x);
+        let rank_label_width = u16::try_from("1. ".len()).expect("rank label width fits u16");
+        assert_eq!(title_x, rank_x.saturating_add(rank_label_width));
+        let (points_x, points_y) = find_run(buffer, "123 pts");
+        assert_eq!(points_x, title_x);
+        assert_eq!(points_y, title_y.saturating_add(1));
+        assert!(
+            cells_for(buffer, "A carefully rendered story")
+                .all(|cell| cell.fg == Theme::classic().muted)
+        );
+
+        let (selected_title_x, selected_y) = find_run(buffer, "An unread story");
+        let arrow_x = find_run_on_row(buffer, "▸", selected_y);
+        let selected_read_x = find_run_on_row(buffer, "✓", selected_y);
+        let selected_rank_x = find_run_on_row(buffer, "2.", selected_y);
+        assert_eq!(selected_read_x, arrow_x.saturating_add(1));
+        assert_eq!(selected_rank_x, selected_read_x.saturating_add(2));
+        assert_eq!(
+            selected_title_x,
+            selected_rank_x.saturating_add(rank_label_width)
+        );
+    }
+
+    #[test]
+    fn story_titles_wrap_to_the_live_panel_width() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut ranked = page();
+        ranked.items[0].title = Some(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda finalword".to_owned(),
+        );
+        let mut app = App::new(ranked);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wrapped story renders");
+        let buffer = terminal.backend().buffer();
+        let (first_x, first_y) = find_run(buffer, "alpha");
+        let (final_x, final_y) = find_run(buffer, "finalword");
+        let (points_x, points_y) = find_run(buffer, "123 pts");
+
+        assert!(final_x >= first_x);
+        assert!(final_y > first_y, "story title did not wrap vertically");
+        assert_eq!(points_x, first_x);
+        assert!(
+            points_y > final_y,
+            "metadata did not follow the wrapped title"
+        );
+    }
+
+    #[test]
+    fn comment_bodies_wrap_to_the_live_thread_width() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("reader".to_owned()),
+                text: Some(
+                    "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda finalword"
+                        .to_owned(),
+                ),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wrapped comment renders");
+        let buffer = terminal.backend().buffer();
+        let (_, first_y) = find_run(buffer, "alpha");
+        let (_, final_y) = find_run(buffer, "finalword");
+        assert!(final_y > first_y, "comment body did not wrap vertically");
+    }
+
+    #[test]
+    fn oversized_comment_keeps_a_visible_truncated_row() {
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("reader".to_owned()),
+                text: Some("wrapped ".repeat(500)),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("oversized comment renders");
+        let buffer = terminal.backend().buffer();
+        find_run(buffer, "reader");
+        find_run(buffer, "…");
+    }
+
+    #[test]
+    fn wrapping_keeps_unicode_graphemes_intact() {
+        assert_eq!(wrap_text("👩‍💻👩‍💻", 2), vec!["👩‍💻", "👩‍💻"]);
+        assert_eq!(wrap_text("界", 1), vec!["…"]);
+        let (lines, truncated) = wrap_text_limited(&"word ".repeat(100_000), 8, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn loading_status_renders_successive_animation_frames() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.set_loading(true);
+        let first = app.loading_indicator();
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("first loading frame renders");
+        find_run(terminal.backend().buffer(), first);
+
+        assert!(app.advance_loading_animation());
+        let second = app.loading_indicator();
+        assert_ne!(first, second);
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("second loading frame renders");
+        find_run(terminal.backend().buffer(), second);
+    }
+
+    #[test]
     fn custom_accent_role_renders_the_brand_chip() {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -892,6 +1604,258 @@ mod tests {
     }
 
     #[test]
+    fn masthead_fills_every_cell_and_marks_active_feed_without_color_alone() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("masthead renders");
+
+        let buffer = terminal.backend().buffer();
+        for x in 0..buffer.area.width {
+            let cell = buffer.cell((x, 0)).expect("masthead cell");
+            assert_eq!(cell.bg, theme.accent, "masthead x={x}");
+            assert_eq!(cell.fg, theme.accent_fg, "masthead x={x}");
+            assert!(cell.modifier.contains(Modifier::BOLD), "masthead x={x}");
+        }
+        let active: Vec<_> = cells_for(buffer, "Top").collect();
+        assert!(
+            active
+                .iter()
+                .all(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+    }
+
+    #[test]
+    fn narrow_masthead_keeps_the_active_feed_and_search_visible() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut jobs_page = page();
+        jobs_page.feed = Feed::Jobs;
+        jobs_page.query = Some("rust".to_owned());
+        let mut app = App::new(jobs_page);
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("narrow frame renders");
+        let buffer = terminal.backend().buffer();
+
+        assert!(cells_for(buffer, "Jobs").all(|cell| {
+            cell.modifier.contains(Modifier::BOLD) && cell.modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+        assert!(find_run(buffer, "hnx").0 < find_run(buffer, "Jobs").0);
+        assert!(find_run(buffer, "rust").0 > find_run(buffer, "Jobs").0);
+    }
+
+    #[test]
+    fn masthead_budgets_wide_search_terms_in_terminal_columns() {
+        let backend = TestBackend::new(65, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut search_page = page();
+        search_page.query = Some("数据库".to_owned());
+        let mut app = App::new(search_page);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wide-character search renders");
+        let buffer = terminal.backend().buffer();
+        let positions = ["数", "据", "库"].map(|symbol| {
+            (0..65)
+                .find(|x| {
+                    buffer
+                        .cell((*x, 0))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                })
+                .expect("wide query glyph is visible")
+        });
+        let masthead = buffer.content()[..65]
+            .iter()
+            .fold(String::new(), |mut output, cell| {
+                output.push_str(cell.symbol());
+                output
+            });
+
+        assert_eq!(positions, [16, 18, 20]);
+        assert!(!masthead.contains("New"));
+    }
+
+    #[test]
+    fn classic_primary_metadata_and_selection_styles_are_semantic() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("classic frame renders");
+        let buffer = terminal.backend().buffer();
+
+        for text in ["A carefully rendered story", "alice"] {
+            assert!(cells_for(buffer, text).all(|cell| {
+                cell.fg == theme.foreground && cell.modifier.contains(Modifier::BOLD)
+            }));
+        }
+        assert!(
+            cells_for(buffer, "123 pts")
+                .all(|cell| { cell.fg == theme.muted && cell.modifier.contains(Modifier::DIM) })
+        );
+        assert!(buffer.content().iter().any(|cell| {
+            cell.bg == ratatui::style::Color::Rgb(229, 228, 222)
+                && cell.fg == ratatui::style::Color::Rgb(0, 0, 0)
+        }));
+    }
+
+    #[test]
+    fn custom_and_no_color_themes_preserve_visual_cues() {
+        let mut custom = Theme::midnight();
+        custom.accent = ratatui::style::Color::Rgb(1, 2, 3);
+        custom.accent_fg = ratatui::style::Color::Rgb(250, 249, 248);
+        custom.selected_fg = ratatui::style::Color::Rgb(247, 17, 219);
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        terminal
+            .draw(|frame| render(frame, &mut app, &custom))
+            .expect("custom frame renders");
+        assert!((0..90).all(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, 0))
+                .is_some_and(|cell| cell.bg == custom.accent && cell.fg == custom.accent_fg)
+        }));
+        let custom_buffer = terminal.backend().buffer();
+        assert!(
+            cells_for(custom_buffer, "A carefully rendered story")
+                .all(|cell| cell.fg == custom.selected_fg)
+        );
+        assert!(cells_for(custom_buffer, "123 pts").all(|cell| cell.fg == custom.muted));
+
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::no_color()))
+            .expect("no-color frame renders");
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content().iter().all(|cell| {
+            cell.fg == ratatui::style::Color::Reset && cell.bg == ratatui::style::Color::Reset
+        }));
+        assert!(cells_for(buffer, "Top").all(|cell| {
+            cell.modifier.contains(Modifier::BOLD) && cell.modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
+    }
+
+    #[test]
+    fn comment_depth_rails_use_semantic_roles_in_three_pane_mode() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.configure_layout(
+            LayoutPreferences::default().with_mode(PaneMode::Three),
+            LayoutPreferences::default(),
+        )
+        .expect("layout validates");
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![
+                Comment {
+                    id: 10,
+                    by: Some("root".to_owned()),
+                    text: Some("root comment body".to_owned()),
+                    ..Comment::default()
+                },
+                Comment {
+                    id: 11,
+                    by: Some("nested".to_owned()),
+                    depth: 2,
+                    ..Comment::default()
+                },
+            ],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("three-pane frame renders");
+        let rail_colors: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "│")
+            .map(|cell| cell.fg)
+            .collect();
+        assert!(rail_colors.contains(&theme.accent));
+        assert!(rail_colors.contains(&theme.link));
+        assert!(app.visible_panes().contains(FocusPane::Detail));
+    }
+
+    #[test]
+    fn all_primary_content_categories_render_bold() {
+        let backend = TestBackend::new(120, 22);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.configure_layout(
+            LayoutPreferences::default().with_mode(PaneMode::Three),
+            LayoutPreferences::default(),
+        )
+        .expect("layout validates");
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("commenter".to_owned()),
+                text: Some("comment body text".to_owned()),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        app.set_article(ArticleView::new(
+            "Article heading",
+            Some("https://example.com/read".to_owned()),
+            "article body text",
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("three-pane content renders");
+        let buffer = terminal.backend().buffer();
+
+        for text in [
+            "Stories",
+            "Thread",
+            "Detail / article",
+            "commenter",
+            "comment body text",
+            "Article heading",
+            "article body text",
+        ] {
+            assert!(
+                cells_for(buffer, text).all(|cell| cell.modifier.contains(Modifier::BOLD)),
+                "{text} should be bold"
+            );
+        }
+        assert!(
+            cells_for(buffer, "https://example.com/read")
+                .all(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+        );
+    }
+
+    #[test]
     fn every_responsive_boundary_renders_the_expected_mode() {
         for (width, expected_mode, expects_tab_hint) in [
             (120, "2-pane", true),
@@ -919,9 +1883,199 @@ mod tests {
             );
             assert!(rendered.contains("? help"));
             assert!(rendered.contains("q quit"));
-            assert!(rendered.contains("Ctrl+U/D half-page"));
-            assert!(rendered.contains("PgUp/PgDn page"));
             assert_eq!(rendered.contains("Tab pane"), expects_tab_hint);
+        }
+    }
+
+    #[test]
+    fn long_status_messages_never_hide_focus_or_recovery_hints() {
+        for width in [50, 79, 80] {
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            app.set_error("a very long recoverable error ".repeat(12));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("status frame renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+
+            assert!(rendered.contains("stories"), "focus missing at {width}");
+            assert!(rendered.contains("? help"), "help missing at {width}");
+            assert!(rendered.contains("q quit"), "quit missing at {width}");
+        }
+    }
+
+    #[test]
+    fn ultra_narrow_status_prioritizes_recovery_then_focus_then_mode() {
+        let full = status_suffix(
+            ResolvedMode::One,
+            FocusPane::Stories,
+            "? help · q quit",
+            u16::MAX,
+        );
+        let full_width = u16::try_from(full.chars().count()).expect("suffix width fits");
+        for (width, expected, omitted) in [
+            (20, "? help · q quit", "stories"),
+            (30, "stories", "1-pane"),
+            (full_width, "1-pane", "never omitted"),
+        ] {
+            let backend = TestBackend::new(width, 8);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("narrow status renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            assert!(rendered.contains(expected), "missing {expected} at {width}");
+            if omitted != "never omitted" {
+                assert!(
+                    !rendered.contains(omitted),
+                    "unexpected {omitted} at {width}"
+                );
+            }
+        }
+
+        for width in [1, 2, 6, 7, 16] {
+            let backend = TestBackend::new(width, 3);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("tiny status renders");
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .any(|cell| cell.symbol() == "q"),
+                "quit cue missing at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_comment_uses_custom_primary_foreground_but_muted_fold() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("selected-commenter".to_owned()),
+                text: Some("selected comment body".to_owned()),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        let mut theme = Theme::midnight();
+        theme.selected_fg = ratatui::style::Color::Rgb(247, 17, 219);
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("selected comment renders");
+        let buffer = terminal.backend().buffer();
+
+        assert!(cells_for(buffer, "selected-commenter").all(|cell| cell.fg == theme.selected_fg));
+        assert!(
+            cells_for(buffer, "selected comment body").all(|cell| cell.fg == theme.selected_fg)
+        );
+        let (author_x, author_y) = find_run(buffer, "selected-commenter");
+        assert_eq!(
+            buffer
+                .cell((author_x.saturating_sub(2), author_y))
+                .map(|cell| cell.fg),
+            Some(theme.muted)
+        );
+    }
+
+    #[test]
+    fn short_help_keeps_dismissal_and_all_categories_visible() {
+        for height in [12, 20] {
+            let backend = TestBackend::new(100, height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            let _ = app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("short help renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            for expected in [
+                "Esc/?/q close",
+                "Navigation",
+                "Layout",
+                "Find and save",
+                "n next",
+                "p previous",
+                "m read/unread",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected} at height {height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_short_help_keeps_its_dismissal_cue_visible() {
+        for width in [20, 30] {
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            let _ = app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("narrow help renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            for expected in [
+                "?/q/Esc close",
+                "Nav j/k",
+                "Layout L",
+                "Find / f",
+                "Read m",
+                "n next p prev",
+            ] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected} at width {width}"
+                );
+            }
         }
     }
 
@@ -951,12 +2105,13 @@ mod tests {
                 output.push_str(cell.symbol());
                 output
             });
-        assert!(rendered.contains("Ctrl+U/D half-page"));
-        assert!(rendered.contains("PgUp/PgDn page"));
+        assert!(rendered.contains("L layout"));
+        assert!(rendered.contains("Alt+h/l resize"));
         assert!(rendered.contains("Press a to read here"));
 
         let detail = layout_for(
             Rect::new(0, 0, 120, 24),
+            app.layout_preferences(),
             FocusPane::Detail,
             SecondaryPane::Detail,
         )
@@ -964,7 +2119,7 @@ mod tests {
         .expect("detail pane");
         assert_eq!(
             buffer.cell((detail.x, detail.y)).map(|cell| cell.fg),
-            Some(theme.highlight)
+            Some(theme.accent)
         );
 
         let _ = app.handle_key(crossterm::event::KeyEvent::new(
@@ -1001,6 +2156,9 @@ mod tests {
                 });
         assert!(help.contains("Ctrl+U/D"));
         assert!(help.contains("PgUp/PgDn"));
+        assert!(help.contains("n next page"));
+        assert!(help.contains("p previous page"));
+        assert!(help.contains("toggle selected story read / unread"));
 
         let _ = app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('?'),
@@ -1045,7 +2203,7 @@ mod tests {
         );
         let _ = app.handle_key(page_down);
         let _ = app.handle_key(page_down);
-        assert_eq!(app.detail_scroll(), 25);
+        assert_eq!(app.detail_scroll(), 21);
 
         terminal
             .draw(|frame| render(frame, &mut app, &theme))
@@ -1066,7 +2224,7 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut app, &theme))
             .expect("resized detail frame renders");
-        assert_eq!(app.detail_scroll(), 9);
+        assert_eq!(app.detail_scroll(), 5);
         let resized =
             terminal
                 .backend()

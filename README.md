@@ -36,6 +36,15 @@ After publication:
 cargo install hnx
 ```
 
+Or install the latest release binary on macOS or Linux:
+
+```bash
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -LsSf https://github.com/alin9661/hnx/releases/latest/download/hnx-installer.sh | sh'
+```
+
+`pipefail` makes a failed download fail the full install command instead of
+letting an empty `sh` invocation report success.
+
 ## Use
 
 Launch the interactive client:
@@ -57,8 +66,9 @@ hnx --offline feed top
 hnx cache stats
 ```
 
-Global options include `--offline`, `--theme <name-or-path>`, and
-`--log-file <path>`. Run `hnx --help` for the complete command surface.
+Global options include `--offline`, `--theme <name-or-path>`, `--config <path>`,
+`--layout two[:STORIES]`, `--layout three[:STORIES,THREAD]`, and
+`--layout reset`. Run `hnx --help` for the complete command surface.
 
 JSON output has a versioned envelope:
 
@@ -79,23 +89,52 @@ declared, omitted, and unresolved counts. Stdout contains only requested data.
 
 ## TUI
 
-The interface adapts without discarding selection or scroll state:
+The default two-pane interface adapts without discarding loaded data,
+selection, folded comments, offsets, or article scroll state:
 
 - 80 columns and wider: story list plus the active thread or detail pane.
 - Below 80 columns: one focused pane.
 
+Press `L` for the optional three-pane Stories → Thread → Detail view. It uses
+three panes at 120 columns and wider, falls back to the configured two-pane
+view from 80–119 columns, then to the focused pane below 80 columns. Any layout
+falls back further rather than rendering a pane narrower than 18 columns.
+
 Use arrow keys or `j`/`k` to move, `Ctrl+U`/`Ctrl+D` to move half a viewport,
-and Page Up/Page Down to move a full viewport. `Tab` or `h`/`l` moves between
-the story list and active right pane; `t` selects the thread and `d` selects
-detail. `Enter` loads a thread or folds a comment, `/` searches, `f` applies a
+and Page Up/Page Down to move a full viewport. `Tab`/`BackTab` cycles visible
+panes; `h`/`l` moves spatially and stops at the edges. `Alt+h`/`Alt+l` shrinks
+or grows the focused pane by two percentage points, and `Alt+0` clears saved
+live overrides. `t` selects the thread and `d` selects detail. `Enter` loads a
+thread or folds a comment, `/` searches, `f` applies a
 case-insensitive regex filter, `b` bookmarks, `a` reads an article in-terminal,
-`o` opens a link, `O` toggles offline mode, `r` refreshes, `?` opens help, and
-`q` quits. The status line always identifies offline/stale/partial data and its
-source.
+`o` opens a link, `O` toggles offline mode, `r` refreshes, and `n`/`p` load the
+next/previous 30-story page. Opening a story marks it read; `m` toggles
+read/unread, and read state persists across launches. `?` opens help, and `q`
+quits or closes help. The status line always identifies offline/stale/partial
+data and its source. Story titles and comment bodies reflow to their live pane
+widths; compact rank and marker gutters keep points aligned beneath each title.
 
 The default `classic` theme uses Y Combinator orange (`#FF6600`) and Hacker
 News cream (`#F7F6F0`). `midnight`, an ANSI 16-color theme, `NO_COLOR`, and
 custom semantic TOML themes are supported.
+
+Layout preferences are loaded in this order: explicit CLI, saved SQLite
+`layout.v1` state, platform `hnx/config.toml`, then built-in defaults. The
+platform file accepts:
+
+```toml
+[layout]
+mode = "two"
+two = [44, 56]
+three = [38, 34, 28]
+two_min_width = 80
+three_min_width = 120
+```
+
+An explicitly requested invalid config exits with status 2. Invalid automatic
+or saved preferences fall back as a complete unit and produce one status-line
+warning. `--layout reset` removes the saved override so TOML changes take
+effect again.
 
 ## Development
 
@@ -112,8 +151,8 @@ Project guides: [architecture](docs/ARCHITECTURE.md),
 [cache design](docs/CACHING.md), [dependencies](docs/DEPENDENCIES.md),
 [performance](docs/PERFORMANCE.md),
 [themes](docs/THEMES.md), [releasing](docs/RELEASING.md),
-[contributing](CONTRIBUTING.md), the [security policy](SECURITY.md), and the
-[changelog](CHANGELOG.md).
+[contributing](CONTRIBUTING.md), [follow-up work](TODOS.md), the [security
+policy](SECURITY.md), and the [changelog](CHANGELOG.md).
 
 ## Provenance and naming
 

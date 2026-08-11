@@ -27,7 +27,11 @@ use futures::StreamExt as _;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{MissedTickBehavior, interval},
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -36,6 +40,7 @@ use crate::{
     app::{App, AppAction, ArticleView},
     article::{Article as FetchedArticle, ArticleClient},
     cache::{Cache, CacheEntry, CacheError},
+    config::{ConfigError, LayoutOverride, LayoutResolution, resolve_layout},
     model::{Comment, Feed, Item, Source, StoryPage, Thread},
     sanitize::{sanitize_single_line, sanitize_text, validate_url},
     theme::Theme,
@@ -50,6 +55,7 @@ const FEED_TTL: Duration = Duration::from_secs(5 * 60);
 const ITEM_TTL: Duration = Duration::from_secs(60 * 60);
 const THREAD_TTL: Duration = Duration::from_secs(15 * 60);
 const SEARCH_TTL: Duration = Duration::from_secs(5 * 60);
+const LAYOUT_SETTING_KEY: &str = "layout.v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,6 +72,14 @@ struct Cli {
     /// Built-in theme name or path to a custom TOML theme.
     #[arg(long, global = true)]
     theme: Option<String>,
+
+    /// Load layout preferences from this TOML file.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Override and save the pane layout: two[:STORIES], three[:STORIES,THREAD], or reset.
+    #[arg(long, global = true, value_name = "LAYOUT")]
+    layout: Option<LayoutOverride>,
 
     /// Write opt-in diagnostics to a local file.
     #[arg(long, global = true, value_name = "PATH")]
@@ -152,7 +166,7 @@ enum CacheCommand {
     Stats,
     /// Remove expired network payloads while preserving local state.
     Prune,
-    /// Remove cached network payloads while preserving bookmarks/settings.
+    /// Remove cached network payloads while preserving bookmarks/read state/settings.
     Clear,
 }
 
@@ -223,13 +237,35 @@ impl<T> Envelope<T> {
 pub async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     init_tracing(cli.log_file.as_ref())?;
+
+    if cli.command.is_some() && cli.config.is_some() {
+        resolve_layout(cli.config.as_deref(), None, cli.layout.as_ref())
+            .map_err(|error| config_input_error(&error))?;
+    }
     let cache = cli
         .cache_dir
         .as_ref()
         .map_or_else(Cache::open_default, Cache::open_in_dir)?;
 
+    if cli.command.is_some()
+        && cli.layout.is_some()
+        && let Some(warning) =
+            apply_requested_layout(&cache, cli.config.as_deref(), cli.layout.as_ref())?
+    {
+        warn_stderr(format_args!("{}", sanitize_single_line(&warning)));
+    }
+
     match cli.command {
-        None => run_tui(cache, cli.offline, cli.theme.as_deref()).await,
+        None => {
+            run_tui(
+                cache,
+                cli.offline,
+                cli.theme.as_deref(),
+                cli.config.as_deref(),
+                cli.layout.as_ref(),
+            )
+            .await
+        }
         Some(Command::Feed {
             feed,
             limit,
@@ -290,6 +326,73 @@ pub async fn run() -> Result<(), CliError> {
             .await
         }
         Some(Command::Cache { command }) => run_cache_command(&cache, command),
+    }
+}
+
+fn resolve_cached_layout(
+    cache: &Cache,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
+) -> Result<(LayoutResolution, Option<String>), CliError> {
+    let (stored_layout, stored_read_warning) = match cache.get_setting(LAYOUT_SETTING_KEY) {
+        Ok(value) => (value, None),
+        Err(_) => (
+            None,
+            Some("Could not read saved layout; using config or built-in defaults".to_owned()),
+        ),
+    };
+    let layout = resolve_layout(config_path, stored_layout.as_deref(), layout_override)
+        .map_err(|error| config_input_error(&error))?;
+    let warning = combine_warnings(stored_read_warning, layout.warning.clone());
+    Ok((layout, warning))
+}
+
+fn persist_layout_action(cache: &Cache, action: &AppAction) -> Result<(), CacheError> {
+    match action {
+        AppAction::LayoutChanged(layout) => cache.set_json_setting(LAYOUT_SETTING_KEY, layout),
+        AppAction::LayoutReset => cache.remove_setting(LAYOUT_SETTING_KEY).map(drop),
+        _ => Ok(()),
+    }
+}
+
+fn persist_startup_layout(cache: &Cache, layout: &LayoutResolution) -> Option<String> {
+    let (action, failure) = if layout.reset_saved {
+        (
+            AppAction::LayoutReset,
+            "Layout reset, but the saved override could not be removed",
+        )
+    } else if layout.persist_cli {
+        (
+            AppAction::LayoutChanged(layout.active.clone()),
+            "Layout applied, but the preference could not be saved",
+        )
+    } else {
+        return None;
+    };
+    persist_layout_action(cache, &action)
+        .err()
+        .map(|_| failure.to_owned())
+}
+
+fn apply_requested_layout(
+    cache: &Cache,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
+) -> Result<Option<String>, CliError> {
+    let (layout, warning) = resolve_cached_layout(cache, config_path, layout_override)?;
+    let persistence_warning = persist_startup_layout(cache, &layout);
+    Ok(combine_warnings(warning, persistence_warning))
+}
+
+fn config_input_error(error: &ConfigError) -> CliError {
+    CliError::InvalidInput(sanitize_single_line(&error.to_string()))
+}
+
+fn combine_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
     }
 }
 
@@ -432,6 +535,7 @@ fn run_cache_command(cache: &Cache, command: CacheCommand) -> Result<(), CliErro
                 writeln!(writer, "threads: {}", stats.threads)?;
                 writeln!(writer, "searches: {}", stats.searches)?;
                 writeln!(writer, "bookmarks: {}", stats.bookmarks)?;
+                writeln!(writer, "read items: {}", stats.read_items)?;
                 writeln!(writer, "settings: {}", stats.settings)?;
                 writeln!(writer, "stale entries: {}", stats.stale_entries)?;
                 writeln!(writer, "payload bytes: {}", stats.payload_bytes)?;
@@ -451,7 +555,7 @@ fn run_cache_command(cache: &Cache, command: CacheCommand) -> Result<(), CliErro
             write_stdout(|writer| {
                 writeln!(
                     writer,
-                    "cleared network cache; bookmarks and settings were preserved"
+                    "cleared network cache; bookmarks, read state, and settings were preserved"
                 )?;
                 Ok(())
             })
@@ -476,7 +580,8 @@ fn write_page(
         OutputFormat::Text => {
             write_stale_marker(writer, page.source, page.stale, page.fetched_at)?;
             for (index, item) in page.items.iter().enumerate() {
-                writeln!(writer, "{}", story_line(index + 1, item))?;
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                writeln!(writer, "{}", story_line(rank, item))?;
             }
             Ok(())
         }
@@ -621,7 +726,16 @@ fn warn_stderr(message: std::fmt::Arguments<'_>) {
 
 fn cache_page(mut entry: CacheEntry<StoryPage>, limit: Option<usize>) -> StoryPage {
     if let Some(limit) = limit {
-        entry.value.items.truncate(limit);
+        if entry.value.items.iter().any(|item| item.rank.is_some()) {
+            entry
+                .value
+                .items
+                .retain(|item| item.rank.is_some_and(|rank| rank <= limit));
+            entry.value.slot_count = entry.value.slot_count.min(limit);
+        } else {
+            entry.value.items.truncate(limit);
+            entry.value.slot_count = entry.value.items.len();
+        }
     }
     entry.value.source = Source::Cache;
     entry.value.stale = entry.metadata.stale;
@@ -769,6 +883,7 @@ enum UiMessage {
     Page {
         request_id: u64,
         context: PageContext,
+        page_index: usize,
         result: Result<StoryPage, String>,
     },
     Thread {
@@ -850,6 +965,8 @@ fn cleanup_once(active: &AtomicBool, cleanup: impl FnOnce()) {
 
 fn restore_terminal_best_effort() {
     let mut output = stdout();
+    #[cfg(unix)]
+    let _ = execute!(output, crossterm::event::PopKeyboardEnhancementFlags);
     let _ = execute!(output, DisableMouseCapture);
     let _ = execute!(output, LeaveAlternateScreen);
     let _ = execute!(output, Show);
@@ -869,6 +986,13 @@ impl TerminalSession {
         enable_raw_mode()?;
         let mut output = stdout();
         execute!(output, EnterAlternateScreen)?;
+        #[cfg(unix)]
+        execute!(
+            output,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        )?;
         execute!(output, EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(output))?;
 
@@ -990,22 +1114,32 @@ async fn run_tui(
     cache: Cache,
     offline: bool,
     requested_theme: Option<&str>,
+    config_path: Option<&Path>,
+    layout_override: Option<&LayoutOverride>,
 ) -> Result<(), CliError> {
+    let (layout, layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
+    let persistence_warning = persist_startup_layout(&cache, &layout);
+    let layout_warning = combine_warnings(layout_warning, persistence_warning);
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
+    let read_items = cache.read_items()?;
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
         || App::empty(Feed::Top),
-        |entry| App::new(cache_page(entry, Some(DEFAULT_LIMIT))),
+        |entry| App::new(cache_page(entry, None)),
     );
+    app.configure_layout(layout.active, layout.baseline)
+        .map_err(|error| CliError::InvalidInput(error.to_string()))?;
     app.set_bookmarks(cache.bookmarks()?.into_iter().map(|item| item.id));
+    app.set_read_items(read_items);
     if offline {
         app.set_offline(true);
         if !had_cached_page {
             app.set_error("No cached top feed is available offline");
         }
     }
-    if let Some(warning) = theme_warning
+    let startup_warning = combine_warnings(theme_warning, layout_warning);
+    if let Some(warning) = startup_warning
         && app.error().is_none()
     {
         app.set_status(warning);
@@ -1020,18 +1154,21 @@ async fn run_tui(
     let mut thread_request_id = 0_u64;
     let mut article_request_id = 0_u64;
     let mut page_task: Option<JoinHandle<()>> = None;
+    let mut pending_page_index = 0_usize;
     let mut thread_task: Option<JoinHandle<()>> = None;
     let mut article_task: Option<JoinHandle<()>> = None;
 
     if !offline {
         page_request_id = next_request_id(page_request_id);
         app.set_loading(true);
+        pending_page_index = 0;
         page_task = Some(spawn_feed(
             sender.clone(),
             client.clone(),
             cache.clone(),
             Feed::Top,
-            DEFAULT_LIMIT,
+            refresh_limit(&app),
+            0,
             page_request_id,
         ));
     }
@@ -1043,11 +1180,16 @@ async fn run_tui(
     let mut events = EventStream::new();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut animation = interval(Duration::from_millis(90));
+    animation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut quit = false;
 
     while !quit {
         let mut redraw = false;
         tokio::select! {
+            _ = animation.tick(), if app.loading() => {
+                redraw = app.advance_loading_animation();
+            }
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Resize(_, _) | Event::FocusGained | Event::FocusLost)) => {
@@ -1096,7 +1238,7 @@ async fn run_tui(
                                     let cached = cache.get_feed_for_limit(feed, DEFAULT_LIMIT)?;
                                     let had_cache = cached.is_some();
                                     if let Some(entry) = cached {
-                                        app.load_page(cache_page(entry, Some(DEFAULT_LIMIT)));
+                                        app.load_page(cache_page(entry, None));
                                     }
                                     if app.offline() {
                                         if !had_cache {
@@ -1104,9 +1246,11 @@ async fn run_tui(
                                         }
                                     } else {
                                         app.set_loading(true);
+                                        let limit = refresh_limit(&app);
+                                        pending_page_index = 0;
                                         page_task = Some(spawn_feed(
                                             sender.clone(), client.clone(), cache.clone(), feed,
-                                            DEFAULT_LIMIT, page_request_id,
+                                            limit, 0, page_request_id,
                                         ));
                                     }
                                 }
@@ -1125,7 +1269,7 @@ async fn run_tui(
                                         let cached = cache.get_search_for_limit(&key, DEFAULT_LIMIT)?;
                                         let had_cache = cached.is_some();
                                         if let Some(entry) = cached {
-                                            app.load_page(cache_page(entry, Some(DEFAULT_LIMIT)));
+                                            app.load_page(cache_page(entry, None));
                                         }
                                         if app.offline() {
                                             if !had_cache {
@@ -1133,9 +1277,11 @@ async fn run_tui(
                                             }
                                         } else {
                                             app.set_loading(true);
+                                            let limit = refresh_limit(&app);
+                                            pending_page_index = 0;
                                             page_task = Some(spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, 0, page_request_id,
                                             ));
                                         }
                                     }
@@ -1147,17 +1293,89 @@ async fn run_tui(
                                         app.set_error("Refresh is unavailable in offline mode");
                                     } else {
                                         app.set_loading(true);
+                                        let page_index = app.page_index();
+                                        let limit = refresh_limit(&app);
+                                        pending_page_index = page_index;
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         } else {
                                             spawn_feed(
                                                 sender.clone(), client.clone(), cache.clone(), app.feed(),
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         });
+                                    }
+                                }
+                                AppAction::NextPage => {
+                                    let target_page = app.page_index().saturating_add(1);
+                                    if let Some(limit) = page_limit(target_page) {
+                                        page_request_id = next_request_id(page_request_id);
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
+                                        abort_task(&mut page_task);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
+                                        let cached = if let Some(query) = app.search_query() {
+                                            cache.get_search_for_limit(&tui_search_key(query), limit)?
+                                        } else {
+                                            cache.get_feed_for_limit(app.feed(), limit)?
+                                        };
+                                        let had_cache = cached.is_some();
+                                        if let Some(entry) = cached {
+                                            app.set_page_at(
+                                                cache_page(entry, None),
+                                                target_page,
+                                                DEFAULT_LIMIT,
+                                            );
+                                        }
+                                        if app.offline() {
+                                            if !had_cache {
+                                                app.set_error(format!(
+                                                    "Page {} is not cached",
+                                                    target_page.saturating_add(1)
+                                                ));
+                                            }
+                                        } else {
+                                            app.set_loading(true);
+                                            pending_page_index = target_page;
+                                            page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
+                                                spawn_search(
+                                                    sender.clone(), client.clone(), cache.clone(), query,
+                                                    limit, target_page, page_request_id,
+                                                )
+                                            } else {
+                                                spawn_feed(
+                                                    sender.clone(), client.clone(), cache.clone(), app.feed(),
+                                                    limit, target_page, page_request_id,
+                                                )
+                                            });
+                                        }
+                                    } else {
+                                        app.set_error("No more pages are available");
+                                    }
+                                }
+                                AppAction::PreviousPage => {
+                                    if app.page_index() == 0 {
+                                        if should_cancel_pending_next(
+                                            app.page_index(),
+                                            page_task.is_some(),
+                                            pending_page_index,
+                                        ) {
+                                            page_request_id = next_request_id(page_request_id);
+                                            abort_task(&mut page_task);
+                                        }
+                                        app.set_status("Already on the first page");
+                                    } else {
+                                        page_request_id = next_request_id(page_request_id);
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
+                                        abort_task(&mut page_task);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
+                                        let _ = app.show_page(app.page_index().saturating_sub(1));
                                     }
                                 }
                                 AppAction::LoadThread(item_id) => {
@@ -1169,6 +1387,7 @@ async fn run_tui(
                                     let had_cache = cached.is_some();
                                     if let Some(entry) = cached {
                                         app.load_thread(cache_thread(entry));
+                                        mark_read(&cache, &mut app, item_id);
                                     }
                                     if app.offline() {
                                         if !had_cache {
@@ -1182,7 +1401,9 @@ async fn run_tui(
                                     }
                                 }
                                 AppAction::LoadArticle(item_id) => {
+                                    thread_request_id = next_request_id(thread_request_id);
                                     article_request_id = next_request_id(article_request_id);
+                                    abort_task(&mut thread_task);
                                     abort_task(&mut article_task);
                                     if app.offline() {
                                         app.set_error("Article fetching is unavailable in offline mode");
@@ -1197,7 +1418,11 @@ async fn run_tui(
                                         }
                                     }
                                 }
-                                AppAction::OpenStory(item_id) => handle_open_story(&mut app, item_id),
+                                AppAction::OpenStory(item_id) => {
+                                    if handle_open_story(&mut app, item_id) {
+                                        mark_read(&cache, &mut app, item_id);
+                                    }
+                                }
                                 AppAction::SetOffline(is_offline) => {
                                     if is_offline {
                                         page_request_id = next_request_id(page_request_id);
@@ -1209,15 +1434,18 @@ async fn run_tui(
                                     } else {
                                         page_request_id = next_request_id(page_request_id);
                                         app.set_loading(true);
+                                        let page_index = app.page_index();
+                                        let limit = refresh_limit(&app);
+                                        pending_page_index = page_index;
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         } else {
                                             spawn_feed(
                                                 sender.clone(), client.clone(), cache.clone(), app.feed(),
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         });
                                     }
@@ -1237,6 +1465,20 @@ async fn run_tui(
                                         app.set_error(format!("Could not update bookmark: {error}"));
                                     }
                                 }
+                                AppAction::ReadChanged { item_id, read } => {
+                                    persist_read(&cache, &mut app, item_id, read);
+                                }
+                                AppAction::LayoutChanged(layout) => {
+                                    let action = AppAction::LayoutChanged(layout);
+                                    if let Err(error) = persist_layout_action(&cache, &action) {
+                                        app.set_status(format!("Layout changed but was not saved: {error}"));
+                                    }
+                                }
+                                AppAction::LayoutReset => {
+                                    if let Err(error) = persist_layout_action(&cache, &AppAction::LayoutReset) {
+                                        app.set_status(format!("Layout reset but saved override remains: {error}"));
+                                    }
+                                }
                             }
                             redraw = true;
                         }
@@ -1248,21 +1490,35 @@ async fn run_tui(
             message = receiver.recv() => {
                 if let Some(message) = message {
                     match message {
-                        UiMessage::Page { request_id, context, result }
-                            if request_id == page_request_id && context.matches(&app) => {
+                        UiMessage::Page { request_id, context, page_index, result }
+                            if request_id == page_request_id => {
                                 page_task.take();
-                                match result {
-                                    Ok(page) => app.refresh_page(page),
-                                    Err(error) => app.set_error(error),
+                                if context.matches(&app) {
+                                    let selected_before = app.selected_item().map(|item| item.id);
+                                    match result {
+                                        Ok(page) if page_index == app.page_index() => app.refresh_page(page),
+                                        Ok(page) => app.set_page_at(page, page_index, DEFAULT_LIMIT),
+                                        Err(error) => app.set_error(error),
+                                    }
+                                    if selected_before != app.selected_item().map(|item| item.id) {
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
+                                    }
                                 }
                             }
                         UiMessage::Thread { request_id, item_id, result }
-                            if request_id == thread_request_id
-                                && app.selected_item().is_some_and(|item| item.id == item_id) => {
+                            if request_id == thread_request_id => {
                                 thread_task.take();
-                                match result {
-                                    Ok(thread) => app.load_thread(thread),
-                                    Err(error) => app.set_error(error),
+                                if app.selected_item().is_some_and(|item| item.id == item_id) {
+                                    match result {
+                                        Ok(thread) => {
+                                            app.load_thread(thread);
+                                            mark_read(&cache, &mut app, item_id);
+                                        }
+                                        Err(error) => app.set_error(error),
+                                    }
                                 }
                             }
                         UiMessage::Article {
@@ -1270,16 +1526,20 @@ async fn run_tui(
                             item_id,
                             title,
                             result,
-                        } if request_id == article_request_id
-                            && app.selected_item().is_some_and(|item| item.id == item_id) => {
+                        } if request_id == article_request_id => {
                             article_task.take();
-                            match result {
-                                Ok(article) => app.set_article(ArticleView::new(
-                                    title,
-                                    Some(article.url.to_string()),
-                                    article.text,
-                                )),
-                                Err(error) => app.set_error(error),
+                            if app.selected_item().is_some_and(|item| item.id == item_id) {
+                                match result {
+                                    Ok(article) => {
+                                        app.set_article(ArticleView::new(
+                                            title,
+                                            Some(article.url.to_string()),
+                                            article.text,
+                                        ));
+                                        mark_read(&cache, &mut app, item_id);
+                                    }
+                                    Err(error) => app.set_error(error),
+                                }
                             }
                         }
                         _ => {}
@@ -1298,6 +1558,8 @@ async fn run_tui(
             }
         }
 
+        app.set_loading(page_task.is_some() || thread_task.is_some() || article_task.is_some());
+
         if redraw && !quit {
             terminal.draw(&mut app, &theme)?;
         }
@@ -1315,6 +1577,7 @@ fn spawn_feed(
     cache: Cache,
     feed: Feed,
     limit: usize,
+    page_index: usize,
     request_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1330,6 +1593,7 @@ fn spawn_feed(
         let _ = sender.send(UiMessage::Page {
             request_id,
             context: PageContext::Feed(feed),
+            page_index,
             result,
         });
     })
@@ -1341,6 +1605,7 @@ fn spawn_search(
     cache: Cache,
     query: String,
     limit: usize,
+    page_index: usize,
     request_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1356,6 +1621,7 @@ fn spawn_search(
         let _ = sender.send(UiMessage::Page {
             request_id,
             context: PageContext::Search(query),
+            page_index,
             result,
         });
     })
@@ -1420,13 +1686,29 @@ fn next_request_id(request_id: u64) -> u64 {
     request_id.wrapping_add(1).max(1)
 }
 
+fn page_limit(page_index: usize) -> Option<usize> {
+    let start = page_index.checked_mul(DEFAULT_LIMIT)?;
+    (start < MAX_LIMIT).then(|| start.saturating_add(DEFAULT_LIMIT).min(MAX_LIMIT))
+}
+
+fn refresh_limit(app: &App) -> usize {
+    page_limit(app.page_index())
+        .unwrap_or(MAX_LIMIT)
+        .max(app.loaded_story_slots())
+        .min(MAX_LIMIT)
+}
+
+fn should_cancel_pending_next(current_page: usize, task_active: bool, pending_page: usize) -> bool {
+    task_active && pending_page > current_page
+}
+
 fn abort_task(task: &mut Option<JoinHandle<()>>) {
     if let Some(task) = task.take() {
         task.abort();
     }
 }
 
-fn open_story(app: &mut App, item_id: u64) {
+fn open_story(app: &mut App, item_id: u64) -> bool {
     let item = app.stories().iter().find(|item| item.id == item_id);
     let external = item
         .and_then(|item| item.url.as_deref())
@@ -1437,17 +1719,40 @@ fn open_story(app: &mut App, item_id: u64) {
     );
     if let Err(error) = open::that(&target) {
         app.set_error(format!("Could not open browser: {error}"));
+        false
     } else {
         app.set_status(format!("Opened {target}"));
+        true
     }
 }
 
-fn handle_open_story(app: &mut App, item_id: u64) {
+fn handle_open_story(app: &mut App, item_id: u64) -> bool {
     if app.offline() {
         app.set_error("Opening URLs is unavailable in offline mode");
+        false
     } else {
-        open_story(app, item_id);
+        open_story(app, item_id)
     }
+}
+
+fn persist_read(cache: &Cache, app: &mut App, item_id: u64, read: bool) {
+    let result = if read {
+        cache.set_read(item_id)
+    } else {
+        cache.remove_read(item_id).map(|_| ())
+    };
+    if let Err(error) = result {
+        if app.error().is_none() {
+            app.set_status(format!("Read state changed but was not saved: {error}"));
+        } else {
+            tracing::warn!(%error, "could not persist read state");
+        }
+    }
+}
+
+fn mark_read(cache: &Cache, app: &mut App, item_id: u64) {
+    app.set_read(item_id, true);
+    persist_read(cache, app, item_id, true);
 }
 
 fn resolve_theme(cache: &Cache, requested: Option<&str>) -> (Theme, Option<String>) {
@@ -1511,18 +1816,23 @@ mod tests {
         io::{self, ErrorKind, Write},
         mem::ManuallyDrop,
         sync::atomic::AtomicBool,
+        time::Duration,
     };
 
     use clap::Parser as _;
 
     use super::{
-        CleanupGuard, Cli, CliError, Command, OutputFormat, PageContext, cleanup_once,
-        handle_open_story, next_request_id, parse_item_id, parse_limit, parse_search_query,
+        CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
+        apply_requested_layout, cache_page, cleanup_once, combine_warnings, config_input_error,
+        handle_open_story, next_request_id, page_limit, parse_item_id, parse_limit,
+        parse_search_query, persist_layout_action, refresh_limit, should_cancel_pending_next,
         write_buffered, write_comments, write_item, write_json, write_page, write_thread,
     };
     use crate::{
         api::SearchType,
-        app::App,
+        app::{App, AppAction},
+        cache::Cache,
+        layout::{LayoutPreferences, PaneMode},
         model::{Comment, Feed, Item, Source, StoryPage, Thread},
     };
 
@@ -1578,11 +1888,222 @@ mod tests {
     }
 
     #[test]
+    fn layout_actions_round_trip_through_sqlite() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let preferences = LayoutPreferences::default().with_mode(PaneMode::Three);
+
+        persist_layout_action(&cache, &AppAction::LayoutChanged(preferences.clone()))
+            .expect("layout persists");
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("layout reads"),
+            Some(preferences)
+        );
+
+        persist_layout_action(&cache, &AppAction::LayoutReset).expect("layout resets");
+        assert_eq!(
+            cache
+                .get_setting(LAYOUT_SETTING_KEY)
+                .expect("setting reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_state_round_trips_through_keyed_sqlite_rows() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        cache.set_read(42).expect("first read state persists");
+        cache.set_read(99).expect("second read state persists");
+        assert_eq!(cache.read_items().expect("read state loads"), vec![42, 99]);
+        assert!(cache.remove_read(42).expect("read state removes"));
+        assert_eq!(cache.read_items().expect("read state reloads"), vec![99]);
+    }
+
+    #[test]
+    fn headless_layout_requests_apply_to_sqlite() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let apply = "three:40,30"
+            .parse::<crate::config::LayoutOverride>()
+            .expect("layout parses");
+        assert!(
+            apply_requested_layout(&cache, None, Some(&apply))
+                .expect("layout applies")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("layout reads")
+                .expect("layout saved")
+                .three,
+            [40, 30, 30]
+        );
+
+        apply_requested_layout(&cache, None, Some(&crate::config::LayoutOverride::Reset))
+            .expect("reset applies");
+        assert_eq!(
+            cache
+                .get_setting(LAYOUT_SETTING_KEY)
+                .expect("setting reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn layout_override_replaces_corrupt_stored_state_despite_warning() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        cache
+            .set_setting(LAYOUT_SETTING_KEY, "{broken")
+            .expect("corrupt setting writes");
+        let apply = "three:40,30"
+            .parse::<crate::config::LayoutOverride>()
+            .expect("layout parses");
+
+        assert!(
+            apply_requested_layout(&cache, None, Some(&apply))
+                .expect("layout applies")
+                .is_some()
+        );
+        assert_eq!(
+            cache
+                .get_json_setting::<LayoutPreferences>(LAYOUT_SETTING_KEY)
+                .expect("replacement reads")
+                .expect("replacement saved")
+                .three,
+            [40, 30, 30]
+        );
+    }
+
+    #[test]
+    fn independent_warnings_are_preserved_and_config_errors_are_sanitized() {
+        assert_eq!(
+            combine_warnings(
+                Some("fallback used".to_owned()),
+                Some("save failed".to_owned())
+            )
+            .as_deref(),
+            Some("fallback used; save failed")
+        );
+
+        let error = crate::config::ConfigError::NotRegular(std::path::PathBuf::from(
+            "bad\u{1b}]8;;https://example.invalid\u{7}name",
+        ));
+        let CliError::InvalidInput(message) = config_input_error(&error) else {
+            panic!("config errors remain invalid-input errors");
+        };
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+        assert!(!message.contains("https://example.invalid"));
+    }
+
+    #[test]
+    fn parses_layout_and_config_options_with_clap_validation() {
+        let cli =
+            Cli::try_parse_from(["hnx", "--config", "custom.toml", "--layout", "three:38,34"])
+                .expect("layout options parse");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("custom.toml"))
+        );
+        assert!(matches!(
+            cli.layout,
+            Some(crate::config::LayoutOverride::Apply {
+                mode: crate::layout::PaneMode::Three,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["hnx", "--layout", "two:10"]).is_err());
+        assert!(Cli::try_parse_from(["hnx", "--layout", "three:50,60"]).is_err());
+    }
+
+    #[test]
     fn numeric_bounds_are_explicit() {
         assert!(parse_item_id("0").is_err());
         assert!(parse_limit("0").is_err());
         assert!(parse_limit("501").is_err());
         assert_eq!(parse_limit("500"), Ok(500));
+    }
+
+    #[test]
+    fn tui_page_limits_grow_by_thirty_and_stop_at_the_api_cap() {
+        assert_eq!(page_limit(0), Some(30));
+        assert_eq!(page_limit(1), Some(60));
+        assert_eq!(page_limit(15), Some(480));
+        assert_eq!(page_limit(16), Some(500));
+        assert_eq!(page_limit(17), None);
+        assert_eq!(page_limit(usize::MAX), None);
+    }
+
+    #[test]
+    fn refresh_retains_the_largest_loaded_prefix() {
+        let mut page = StoryPage {
+            feed: Feed::Top,
+            query: None,
+            items: (1..=60)
+                .map(|rank| Item {
+                    id: rank,
+                    rank: Some(usize::try_from(rank).expect("rank fits")),
+                    ..Item::default()
+                })
+                .collect(),
+            slot_count: 60,
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        };
+        let mut app = App::new(page.clone());
+        assert_eq!(refresh_limit(&app), 60);
+
+        page.items.truncate(30);
+        app.refresh_page(page);
+        assert_eq!(refresh_limit(&app), 60);
+    }
+
+    #[test]
+    fn cached_limits_follow_canonical_rank_slots() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let mut page = StoryPage {
+            feed: Feed::Top,
+            query: None,
+            items: (1..=60)
+                .filter(|rank| *rank != 30)
+                .map(|rank| Item {
+                    id: rank,
+                    rank: Some(usize::try_from(rank).expect("rank fits")),
+                    ..Item::default()
+                })
+                .collect(),
+            slot_count: 60,
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 1,
+        };
+        cache
+            .put_feed(&page, Duration::from_secs(60))
+            .expect("ranked page stores");
+        page = cache_page(
+            cache
+                .get_feed(Feed::Top)
+                .expect("ranked page reads")
+                .expect("ranked page exists"),
+            Some(30),
+        );
+
+        assert_eq!(page.slot_count, 30);
+        assert_eq!(page.items.len(), 29);
+        assert!(
+            page.items
+                .iter()
+                .all(|item| item.rank.is_some_and(|rank| rank <= 30))
+        );
+    }
+
+    #[test]
+    fn previous_cancels_forward_navigation_but_not_the_initial_refresh() {
+        assert!(should_cancel_pending_next(0, true, 1));
+        assert!(!should_cancel_pending_next(0, true, 0));
+        assert!(!should_cancel_pending_next(0, false, 1));
     }
 
     #[test]
@@ -1599,6 +2120,7 @@ mod tests {
             feed: Feed::Top,
             query: None,
             items: Vec::new(),
+            slot_count: 0,
             source: Source::Cache,
             stale: false,
             fetched_at: 1,
@@ -1626,6 +2148,7 @@ mod tests {
                 url: Some("https://example.com".to_owned()),
                 ..Item::default()
             }],
+            slot_count: 1,
             source: Source::Cache,
             stale: false,
             fetched_at: 1,
@@ -1739,6 +2262,7 @@ mod tests {
             feed: Feed::Top,
             query: None,
             items: vec![item.clone()],
+            slot_count: 1,
             source: Source::Cache,
             stale: true,
             fetched_at: 123,

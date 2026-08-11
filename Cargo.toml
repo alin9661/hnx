@@ -1,6 +1,6 @@
 [package]
 name = "hnx"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast, cache-first Hacker News terminal client"
@@ -32,6 +32,7 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.12"
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]

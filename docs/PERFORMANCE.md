@@ -38,7 +38,8 @@ The first integrated release-mode run on the same machine produced:
 | --- | ---: |
 | Hybrid Top, 30 items, five fresh-cache samples | 0.32 s median (0.30–0.67 s) |
 | Warm offline Top JSON, 100 sequential processes | 4.9 ms mean per process |
-| 10k-comment navigation + 120x40 two-panel frame | 181.8 µs median; 201.7 µs sample p95 |
+| 10k-comment navigation + 120x40 two-pane frame | 88.7 µs median; 97.1 µs sample p95 |
+| 10k-comment navigation + 160x40 three-pane frame | 115.0 µs median; 132.2 µs sample p95 |
 | Stripped release binary | 9.06 MB |
 | `hnx --version` peak RSS | 7.8 MB |
 
@@ -51,10 +52,13 @@ Run microbenchmarks with:
 cargo bench
 ```
 
-The `key_to_frame_10k_comments_120x40` benchmark preloads 10,000 comments,
-moves the selection near the end of the thread, and measures one navigation
-event plus one complete Ratatui TestBackend frame. This intentionally excludes
-thread construction so the result tracks steady-state interaction latency.
+The `two_pane_10k_comments_120x40` and
+`three_pane_10k_comments_160x40` benchmarks preload 10,000 comments, move the
+selection near the end of the thread, and measure width-aware story and comment
+wrapping, one navigation event, and one complete Ratatui TestBackend frame. They
+intentionally exclude thread construction so the result tracks steady-state
+interaction latency and must remain below the documented 16 ms p95 budget in
+both layouts.
 
 Measure end-to-end commands using a warm and cold cache separately. Network
 results must report region, connection type, sample count, p50, and p95; a

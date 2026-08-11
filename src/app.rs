@@ -1,57 +1,21 @@
 //! Event-driven application state for the terminal interface.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use regex::RegexBuilder;
 
-use crate::model::{Comment, Feed, Item, Source, StoryPage, Thread};
+use crate::{
+    layout::{LayoutError, LayoutPreferences, PaneSet, ResolvedMode},
+    model::{Comment, Feed, Item, Source, StoryPage, Thread},
+};
 
-/// The content pane that receives navigation input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FocusPane {
-    #[default]
-    Stories,
-    Thread,
-    Detail,
-}
+pub use crate::layout::{FocusPane, SecondaryPane};
 
-impl FocusPane {
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Stories => Self::Thread,
-            Self::Thread => Self::Detail,
-            Self::Detail => Self::Stories,
-        }
-    }
-
-    #[must_use]
-    pub const fn previous(self) -> Self {
-        match self {
-            Self::Stories => Self::Detail,
-            Self::Thread => Self::Stories,
-            Self::Detail => Self::Thread,
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Stories => "stories",
-            Self::Thread => "thread",
-            Self::Detail => "detail",
-        }
-    }
-}
-
-/// Which secondary pane remains visible beside stories in the two-pane layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SecondaryPane {
-    #[default]
-    Thread,
-    Detail,
-}
+const QUIT_REPEAT_GUARD: Duration = Duration::from_millis(750);
 
 /// The active text prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +71,8 @@ pub enum AppAction {
     LoadThread(u64),
     Search(String),
     Refresh,
+    NextPage,
+    PreviousPage,
     OpenStory(u64),
     LoadArticle(u64),
     SetOffline(bool),
@@ -114,6 +80,12 @@ pub enum AppAction {
         item_id: u64,
         bookmarked: bool,
     },
+    ReadChanged {
+        item_id: u64,
+        read: bool,
+    },
+    LayoutChanged(LayoutPreferences),
+    LayoutReset,
 }
 
 impl AppAction {
@@ -226,15 +198,23 @@ pub struct App {
     page_source: Option<Source>,
     page_stale: bool,
     page_fetched_at: Option<i64>,
+    page_slots: usize,
+    page_index: usize,
+    page_size: usize,
     source: Option<Source>,
     stale: bool,
     fetched_at: Option<i64>,
     offline: bool,
     loading: bool,
+    loading_frame: u8,
     status: Option<String>,
     error: Option<String>,
     focus: FocusPane,
     secondary: SecondaryPane,
+    layout: LayoutPreferences,
+    layout_baseline: LayoutPreferences,
+    visible_panes: PaneSet,
+    resolved_mode: ResolvedMode,
     story_selection: Selection,
     comment_selection: Selection,
     detail_scroll: u16,
@@ -244,9 +224,11 @@ pub struct App {
     filter_regex: Option<regex::Regex>,
     search_query: Option<String>,
     bookmarks: BTreeSet<u64>,
+    read_items: BTreeSet<u64>,
     bookmarks_only: bool,
     prompt: Option<Prompt>,
     help_visible: bool,
+    quit_guard_until: Option<Instant>,
 }
 
 impl App {
@@ -274,15 +256,23 @@ impl App {
             page_source: None,
             page_stale: false,
             page_fetched_at: None,
+            page_slots: 0,
+            page_index: 0,
+            page_size: 30,
             source: None,
             stale: false,
             fetched_at: None,
             offline: false,
             loading: false,
+            loading_frame: 0,
             status: None,
             error: None,
             focus: FocusPane::Stories,
             secondary: SecondaryPane::Thread,
+            layout: LayoutPreferences::default(),
+            layout_baseline: LayoutPreferences::default(),
+            visible_panes: PaneSet::two(SecondaryPane::Thread),
+            resolved_mode: ResolvedMode::Two,
             story_selection: Selection::empty(),
             comment_selection: Selection::empty(),
             detail_scroll: 0,
@@ -292,9 +282,11 @@ impl App {
             filter_regex: None,
             search_query: None,
             bookmarks: BTreeSet::new(),
+            read_items: BTreeSet::new(),
             bookmarks_only: false,
             prompt: None,
             help_visible: false,
+            quit_guard_until: None,
         }
     }
 
@@ -328,6 +320,21 @@ impl App {
         self.loading
     }
 
+    #[must_use]
+    pub const fn loading_indicator(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.loading_frame as usize % FRAMES.len()]
+    }
+
+    /// Advances the loading indicator when an asynchronous operation is active.
+    pub fn advance_loading_animation(&mut self) -> bool {
+        if !self.loading {
+            return false;
+        }
+        self.loading_frame = self.loading_frame.wrapping_add(1);
+        true
+    }
+
     /// Whether the loaded comment tree is known to omit comments.
     #[must_use]
     pub const fn thread_partial(&self) -> bool {
@@ -352,6 +359,16 @@ impl App {
     #[must_use]
     pub const fn secondary_pane(&self) -> SecondaryPane {
         self.secondary
+    }
+
+    #[must_use]
+    pub const fn layout_preferences(&self) -> &LayoutPreferences {
+        &self.layout
+    }
+
+    #[must_use]
+    pub const fn visible_panes(&self) -> PaneSet {
+        self.visible_panes
     }
 
     #[must_use]
@@ -385,6 +402,41 @@ impl App {
     }
 
     #[must_use]
+    pub fn read_items(&self) -> &BTreeSet<u64> {
+        &self.read_items
+    }
+
+    #[must_use]
+    pub fn is_read(&self, item_id: u64) -> bool {
+        self.read_items.contains(&item_id)
+    }
+
+    #[must_use]
+    pub const fn page_index(&self) -> usize {
+        self.page_index
+    }
+
+    /// Switches to an already-loaded page in the cached ranked prefix.
+    pub fn show_page(&mut self, page_index: usize) -> bool {
+        if !self.page_has_stories(page_index) {
+            return false;
+        }
+        self.page_index = page_index;
+        self.rebuild_visible_stories();
+        self.reset_story_selection();
+        self.clear_story_context();
+        self.set_focus(FocusPane::Stories);
+        self.loading = false;
+        self.error = None;
+        self.status = Some(format!(
+            "Page {} · {} stories",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
+        true
+    }
+
+    #[must_use]
     pub fn is_bookmarked(&self, item_id: u64) -> bool {
         self.bookmarks.contains(&item_id)
     }
@@ -392,6 +444,12 @@ impl App {
     #[must_use]
     pub fn stories(&self) -> &[Item] {
         &self.stories
+    }
+
+    /// Upstream slots covered by the currently loaded ranked prefix.
+    #[must_use]
+    pub fn loaded_story_slots(&self) -> usize {
+        self.page_slots
     }
 
     /// Iterates over stories after applying the local filter and bookmarks-only view.
@@ -411,6 +469,18 @@ impl App {
             .unwrap_or_default()
             .iter()
             .filter_map(|index| self.stories.get(*index))
+    }
+
+    /// Returns the absolute feed rank for an item in the filtered visible view.
+    #[must_use]
+    pub fn visible_story_rank(&self, visible_index: usize) -> Option<usize> {
+        self.visible_story_indices
+            .get(visible_index)
+            .and_then(|index| {
+                self.stories
+                    .get(*index)
+                    .map(|item| item.rank.unwrap_or_else(|| index.saturating_add(1)))
+            })
     }
 
     #[must_use]
@@ -515,6 +585,19 @@ impl App {
     /// Replaces the story page while retaining local preferences such as bookmarks and offline
     /// mode.
     pub fn set_page(&mut self, page: StoryPage) {
+        self.set_page_at(page, 0, 30);
+    }
+
+    /// Replaces the story data and displays one page from its ranked prefix.
+    pub fn set_page_at(&mut self, page: StoryPage, page_index: usize, page_size: usize) {
+        let page_size = page_size.max(1);
+        if page_index > 0 && !page_contains_page(&page.items, page_index, page_size) {
+            self.set_error("No more stories are available");
+            return;
+        }
+        self.page_index = page_index;
+        self.page_size = page_size;
+        self.page_slots = page.covered_slots();
         self.feed = page.feed;
         self.search_query = page.query;
         self.stories = page.items;
@@ -531,7 +614,11 @@ impl App {
         self.detail_scroll = 0;
         self.loading = false;
         self.error = None;
-        self.status = Some(format!("{} stories loaded", self.stories.len()));
+        self.status = Some(format!(
+            "Page {} · {} stories",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
         self.rebuild_visible_stories();
         self.reset_story_selection();
         self.comment_selection.reset(0);
@@ -556,8 +643,10 @@ impl App {
         }
 
         let selected_id = self.selected_item().map(|item| item.id);
+        let page_slots = page.covered_slots();
         self.feed = page.feed;
         self.search_query = page.query;
+        self.page_slots = page_slots;
         self.stories = page.items;
         self.page_source = Some(page.source);
         self.page_stale = page.stale;
@@ -582,7 +671,11 @@ impl App {
             self.clear_story_context();
             self.set_focus(FocusPane::Stories);
         }
-        self.status = Some(format!("{} stories refreshed", self.stories.len()));
+        self.status = Some(format!(
+            "Page {} · {} stories refreshed",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
     }
 
     pub fn load_thread(&mut self, thread: Thread) {
@@ -634,6 +727,22 @@ impl App {
         self.reset_story_selection_after_view_change();
     }
 
+    pub fn set_read_items<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.read_items = items.into_iter().collect();
+    }
+
+    /// Updates local read state after its user-visible operation has succeeded.
+    pub fn set_read(&mut self, item_id: u64, read: bool) {
+        if read {
+            self.read_items.insert(item_id);
+        } else {
+            self.read_items.remove(&item_id);
+        }
+    }
+
     pub fn set_bookmarked(&mut self, item_id: u64, bookmarked: bool) {
         if bookmarked {
             self.bookmarks.insert(item_id);
@@ -656,8 +765,10 @@ impl App {
     }
 
     pub fn set_loading(&mut self, loading: bool) {
+        let started = loading && !self.loading;
         self.loading = loading;
-        if loading {
+        if started {
+            self.loading_frame = 0;
             self.error = None;
         }
     }
@@ -689,6 +800,34 @@ impl App {
         }
     }
 
+    /// Installs validated active preferences and the TOML/built-in reset baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing either value when one preference set is invalid.
+    pub fn configure_layout(
+        &mut self,
+        active: LayoutPreferences,
+        baseline: LayoutPreferences,
+    ) -> Result<(), LayoutError> {
+        let active = active.validate()?;
+        let baseline = baseline.validate()?;
+        self.layout = active;
+        self.layout_baseline = baseline;
+        Ok(())
+    }
+
+    /// Records which panes the latest frame actually rendered.
+    pub fn set_rendered_panes(&mut self, panes: PaneSet, mode: ResolvedMode) {
+        self.visible_panes = panes;
+        self.resolved_mode = mode;
+        if !panes.contains(self.focus)
+            && let Some(focus) = panes.ordered().next()
+        {
+            self.set_focus(focus);
+        }
+    }
+
     /// Records the number of logical rows visible in each selectable pane. The renderer calls
     /// this after computing the responsive layout; no timer or tick is involved.
     pub fn set_viewports(&mut self, story_rows: usize, comment_rows: usize) {
@@ -712,6 +851,9 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.kind == KeyEventKind::Release {
+            if key.code == KeyCode::Char('q') {
+                self.quit_guard_until = None;
+            }
             return AppAction::None;
         }
 
@@ -721,15 +863,49 @@ impl App {
             return AppAction::Quit;
         }
 
+        let plain_q = key.code == KeyCode::Char('q') && key.modifiers.is_empty();
+        if plain_q {
+            let now = Instant::now();
+            if self.quit_guard_until.is_some_and(|until| now < until) {
+                self.quit_guard_until = Some(now + QUIT_REPEAT_GUARD);
+                return AppAction::None;
+            }
+            self.quit_guard_until = None;
+        } else {
+            self.quit_guard_until = None;
+        }
+
+        // Repeated q events may outlive the help modal they dismissed. Ignore
+        // repeats so a held dismissal key cannot become a global quit command.
+        if key.kind == KeyEventKind::Repeat && key.code == KeyCode::Char('q') {
+            return AppAction::None;
+        }
+
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
         }
 
         if self.help_visible {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
                 self.help_visible = false;
+                if plain_q {
+                    self.quit_guard_until = Some(Instant::now() + QUIT_REPEAT_GUARD);
+                }
             }
             return AppAction::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return match key.code {
+                KeyCode::Char('h') => self.resize_focused_pane(-2),
+                KeyCode::Char('l') => self.resize_focused_pane(2),
+                KeyCode::Char('0') => {
+                    self.layout = self.layout_baseline.clone();
+                    self.status = Some("Layout overrides reset".to_owned());
+                    AppAction::LayoutReset
+                }
+                _ => AppAction::None,
+            };
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -767,6 +943,7 @@ impl App {
                 AppAction::None
             }
             KeyCode::Char('b' | ' ') => self.toggle_selected_bookmark(),
+            KeyCode::Char('m') => self.toggle_selected_read(),
             KeyCode::Char('B') => {
                 self.bookmarks_only = !self.bookmarks_only;
                 self.rebuild_visible_stories();
@@ -778,8 +955,15 @@ impl App {
                 AppAction::SetOffline(self.offline)
             }
             KeyCode::Char('r') => {
-                self.loading = true;
+                self.set_loading(true);
                 AppAction::Refresh
+            }
+            KeyCode::Char('n') => AppAction::NextPage,
+            KeyCode::Char('p') => AppAction::PreviousPage,
+            KeyCode::Char('L') => {
+                self.layout.mode = self.layout.mode.toggled();
+                self.status = Some(format!("{}-pane layout requested", self.layout.mode));
+                AppAction::LayoutChanged(self.layout.clone())
             }
             KeyCode::Char('t') => {
                 self.set_focus(FocusPane::Thread);
@@ -813,16 +997,20 @@ impl App {
                 self.select_last();
                 AppAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.toggle_panel_focus();
+            KeyCode::Tab => {
+                self.cycle_visible_panes(true);
+                AppAction::None
+            }
+            KeyCode::BackTab => {
+                self.cycle_visible_panes(false);
                 AppAction::None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.focus_secondary_panel();
+                self.move_focus_spatially(true);
                 AppAction::None
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.set_focus(FocusPane::Stories);
+                self.move_focus_spatially(false);
                 AppAction::None
             }
             KeyCode::Char('[') => self.change_feed(-1),
@@ -1043,18 +1231,48 @@ impl App {
         .min(self.detail_max_scroll);
     }
 
-    fn focus_secondary_panel(&mut self) {
-        self.set_focus(match self.secondary {
-            SecondaryPane::Thread => FocusPane::Thread,
-            SecondaryPane::Detail => FocusPane::Detail,
-        });
+    fn cycle_visible_panes(&mut self, forward: bool) {
+        let panes: Vec<_> = self.visible_panes.ordered().collect();
+        let Some(index) = panes.iter().position(|pane| *pane == self.focus) else {
+            return;
+        };
+        let next = if forward {
+            (index + 1) % panes.len()
+        } else {
+            index.checked_sub(1).unwrap_or(panes.len() - 1)
+        };
+        self.set_focus(panes[next]);
     }
 
-    fn toggle_panel_focus(&mut self) {
-        if self.focus == FocusPane::Stories {
-            self.focus_secondary_panel();
+    fn move_focus_spatially(&mut self, right: bool) {
+        let panes: Vec<_> = self.visible_panes.ordered().collect();
+        let Some(index) = panes.iter().position(|pane| *pane == self.focus) else {
+            return;
+        };
+        let next = if right {
+            index.checked_add(1).filter(|next| *next < panes.len())
         } else {
-            self.set_focus(FocusPane::Stories);
+            index.checked_sub(1)
+        };
+        if let Some(next) = next {
+            self.set_focus(panes[next]);
+        }
+    }
+
+    fn resize_focused_pane(&mut self, delta: i8) -> AppAction {
+        match self
+            .layout
+            .resized_for(self.resolved_mode, self.focus, delta)
+        {
+            Ok(layout) => {
+                self.layout = layout;
+                self.status = Some(format!("{} pane resized", self.focus.label()));
+                AppAction::LayoutChanged(self.layout.clone())
+            }
+            Err(error) => {
+                self.status = Some(error.to_string());
+                AppAction::None
+            }
         }
     }
 
@@ -1092,7 +1310,7 @@ impl App {
                 let Some(item_id) = self.selected_item().map(|item| item.id) else {
                     return AppAction::None;
                 };
-                self.loading = true;
+                self.set_loading(true);
                 self.set_focus(FocusPane::Thread);
                 AppAction::LoadThread(item_id)
             }
@@ -1104,16 +1322,18 @@ impl App {
         }
     }
 
-    fn open_selected(&self) -> AppAction {
-        self.selected_item()
-            .map_or(AppAction::None, |item| AppAction::OpenStory(item.id))
+    fn open_selected(&mut self) -> AppAction {
+        let Some(item_id) = self.selected_item().map(|item| item.id) else {
+            return AppAction::None;
+        };
+        AppAction::OpenStory(item_id)
     }
 
     fn load_selected_article(&mut self) -> AppAction {
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return AppAction::None;
         };
-        self.loading = true;
+        self.set_loading(true);
         self.set_focus(FocusPane::Detail);
         AppAction::LoadArticle(item_id)
     }
@@ -1130,6 +1350,24 @@ impl App {
         }
     }
 
+    fn toggle_selected_read(&mut self) -> AppAction {
+        let Some(item_id) = self.selected_item().map(|item| item.id) else {
+            return AppAction::None;
+        };
+        let read = if self.read_items.remove(&item_id) {
+            false
+        } else {
+            self.read_items.insert(item_id);
+            true
+        };
+        self.status = Some(if read {
+            "Marked as read".to_owned()
+        } else {
+            "Marked as unread".to_owned()
+        });
+        AppAction::ReadChanged { item_id, read }
+    }
+
     fn choose_feed(&mut self, feed: Feed) -> AppAction {
         self.begin_page_load(feed, None, format!("Loading {}", feed.label()));
         AppAction::LoadFeed(feed)
@@ -1138,15 +1376,18 @@ impl App {
     fn begin_page_load(&mut self, feed: Feed, query: Option<String>, status: String) {
         self.feed = feed;
         self.search_query = query;
+        self.page_index = 0;
+        self.page_size = 30;
         self.stories.clear();
         self.visible_story_indices.clear();
         self.story_selection.reset(0);
         self.page_source = None;
         self.page_stale = false;
         self.page_fetched_at = None;
+        self.page_slots = 0;
         self.clear_story_context();
         self.set_focus(FocusPane::Stories);
-        self.loading = true;
+        self.set_loading(true);
         self.error = None;
         self.status = Some(status);
     }
@@ -1207,14 +1448,48 @@ impl App {
     }
 
     fn rebuild_visible_stories(&mut self) {
+        let start = self.page_index.saturating_mul(self.page_size);
+        let end = start.saturating_add(self.page_size);
         let indices = self
             .stories
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| self.story_is_visible(item).then_some(index))
+            .filter_map(|(index, item)| {
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                (rank > start && rank <= end && self.story_is_visible(item)).then_some(index)
+            })
             .collect();
         self.visible_story_indices = indices;
     }
+
+    fn visible_page_len(&self) -> usize {
+        self.stories_on_page(self.page_index).count()
+    }
+
+    fn page_has_stories(&self, page_index: usize) -> bool {
+        self.stories_on_page(page_index).next().is_some()
+    }
+
+    fn stories_on_page(&self, page_index: usize) -> impl Iterator<Item = &Item> {
+        let start = page_index.saturating_mul(self.page_size);
+        let end = start.saturating_add(self.page_size);
+        self.stories
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, item)| {
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                (rank > start && rank <= end).then_some(item)
+            })
+    }
+}
+
+fn page_contains_page(items: &[Item], page_index: usize, page_size: usize) -> bool {
+    let start = page_index.saturating_mul(page_size);
+    let end = start.saturating_add(page_size);
+    items.iter().enumerate().any(|(index, item)| {
+        let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+        rank > start && rank <= end
+    })
 }
 
 fn flatten_comments(comments: &[Comment]) -> Vec<Comment> {
@@ -1249,7 +1524,7 @@ fn flatten_comments(comments: &[Comment]) -> Vec<Comment> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::{App, AppAction, FocusPane};
     use crate::model::{Comment, Feed, Item, Source, StoryPage, Thread};
@@ -1267,6 +1542,7 @@ mod tests {
                     ..Item::default()
                 })
                 .collect(),
+            slot_count: 8,
             source: Source::Algolia,
             stale: false,
             fetched_at: 42,
@@ -1279,6 +1555,10 @@ mod tests {
 
     fn ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
     }
 
     #[test]
@@ -1413,7 +1693,132 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_keys_move_between_two_physical_panels() {
+    fn q_closes_help_without_quitting_the_application() {
+        let mut app = App::new(page());
+        assert_eq!(app.handle_key(key(KeyCode::Char('?'))), AppAction::None);
+        assert!(app.help_visible());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::None);
+        assert!(!app.help_visible());
+        assert_eq!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            AppAction::None
+        );
+        // Terminals without enhanced key reporting send autorepeat as another
+        // Press; the rolling guard covers that fallback too.
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            AppAction::None
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::Quit);
+    }
+
+    #[test]
+    fn loading_animation_advances_only_while_work_is_active() {
+        let mut app = App::new(page());
+        let idle_frame = app.loading_indicator();
+        assert!(!app.advance_loading_animation());
+        assert_eq!(app.loading_indicator(), idle_frame);
+
+        app.set_loading(true);
+        let first = app.loading_indicator();
+        assert!(app.advance_loading_animation());
+        assert_ne!(app.loading_indicator(), first);
+        app.set_loading(false);
+        let stopped = app.loading_indicator();
+        assert!(!app.advance_loading_animation());
+        assert_eq!(app.loading_indicator(), stopped);
+    }
+
+    #[test]
+    fn pagination_keeps_absolute_ranks_and_can_return_to_page_one() {
+        let mut ranked = page();
+        ranked.items = (1..=65)
+            .map(|id| Item {
+                id,
+                title: Some(format!("Story {id}")),
+                ..Item::default()
+            })
+            .collect();
+        let mut app = App::new(ranked.clone());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), AppAction::NextPage);
+        app.set_page_at(ranked, 1, 30);
+        assert_eq!(app.page_index(), 1);
+        assert_eq!(app.visible_item_count(), 30);
+        assert_eq!(app.visible_story_rank(0), Some(31));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(31));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('p'))),
+            AppAction::PreviousPage
+        );
+        assert!(app.show_page(0));
+        assert_eq!(app.page_index(), 0);
+        assert_eq!(app.visible_story_rank(0), Some(1));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+    }
+
+    #[test]
+    fn pagination_uses_upstream_slots_when_a_story_is_unreadable() {
+        let mut ranked = page();
+        ranked.items = (1..=60)
+            .filter(|rank| *rank != 30)
+            .map(|rank| Item {
+                id: u64::try_from(rank).expect("rank fits"),
+                rank: Some(rank),
+                title: Some(format!("Story {rank}")),
+                ..Item::default()
+            })
+            .collect();
+        let mut app = App::new(ranked.clone());
+
+        assert_eq!(app.visible_item_count(), 29);
+        app.set_page_at(ranked, 1, 30);
+        assert_eq!(app.visible_story_rank(0), Some(31));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(31));
+    }
+
+    #[test]
+    fn stories_can_be_marked_read_and_implicit_reads_wait_for_success() {
+        let mut app = App::new(page());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            AppAction::ReadChanged {
+                item_id: 1,
+                read: true,
+            }
+        );
+        assert!(app.is_read(1));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            AppAction::ReadChanged {
+                item_id: 1,
+                read: false,
+            }
+        );
+        assert!(!app.is_read(1));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            AppAction::LoadThread(1)
+        );
+        assert!(!app.is_read(1));
+        app.set_read(1, true);
+        assert!(app.is_read(1));
+    }
+
+    #[test]
+    fn navigation_follows_the_last_rendered_pane_set() {
         let mut app = App::new(page());
 
         let _ = app.handle_key(key(KeyCode::Tab));
@@ -1423,6 +1828,10 @@ mod tests {
 
         let _ = app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.focus(), FocusPane::Detail);
+        app.set_rendered_panes(
+            crate::layout::PaneSet::two(super::SecondaryPane::Detail),
+            crate::layout::ResolvedMode::Two,
+        );
         let _ = app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.focus(), FocusPane::Stories);
         let _ = app.handle_key(key(KeyCode::Char('l')));
@@ -1433,6 +1842,171 @@ mod tests {
         let _ = app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.focus(), FocusPane::Thread);
         assert_eq!(app.secondary_pane(), super::SecondaryPane::Thread);
+    }
+
+    #[test]
+    fn three_pane_navigation_cycles_and_stops_at_spatial_edges() {
+        let mut app = App::new(page());
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+
+        let _ = app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Thread);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        let _ = app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus(), FocusPane::Detail);
+    }
+
+    #[test]
+    fn layout_toggle_resize_and_reset_emit_persistence_actions() {
+        let mut app = App::new(page());
+        let baseline = crate::layout::LayoutPreferences::default();
+        app.configure_layout(baseline.clone(), baseline.clone())
+            .expect("layout validates");
+
+        let action = app.handle_key(key(KeyCode::Char('L')));
+        assert!(matches!(action, AppAction::LayoutChanged(_)));
+        assert_eq!(
+            app.layout_preferences().mode,
+            crate::layout::PaneMode::Three
+        );
+
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+        let action = app.handle_key(alt_key(KeyCode::Char('l')));
+        assert!(matches!(action, AppAction::LayoutChanged(_)));
+        assert_eq!(app.layout_preferences().three, [40, 32, 28]);
+
+        assert_eq!(
+            app.handle_key(alt_key(KeyCode::Char('0'))),
+            AppAction::LayoutReset
+        );
+        assert_eq!(app.layout_preferences(), &baseline);
+    }
+
+    #[test]
+    fn rejected_resize_is_nonfatal_and_preserves_state() {
+        let mut app = App::new(page());
+        let preferences = crate::layout::LayoutPreferences {
+            two: [85, 15],
+            ..crate::layout::LayoutPreferences::default()
+        };
+        app.configure_layout(
+            preferences.clone(),
+            crate::layout::LayoutPreferences::default(),
+        )
+        .expect("layout validates");
+        app.set_rendered_panes(
+            crate::layout::PaneSet::two(super::SecondaryPane::Thread),
+            crate::layout::ResolvedMode::Two,
+        );
+
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('l'))), AppAction::None);
+        assert_eq!(app.layout_preferences(), &preferences);
+        assert!(
+            app.status()
+                .is_some_and(|status| status.contains("rejected"))
+        );
+    }
+
+    #[test]
+    fn one_pane_resize_is_nonfatal_and_preserves_preferences() {
+        let mut app = App::new(page());
+        let preferences = app.layout_preferences().clone();
+        app.set_rendered_panes(
+            crate::layout::PaneSet::one(FocusPane::Stories),
+            crate::layout::ResolvedMode::One,
+        );
+
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('h'))), AppAction::None);
+        assert_eq!(app.handle_key(alt_key(KeyCode::Char('l'))), AppAction::None);
+        assert_eq!(app.layout_preferences(), &preferences);
+        assert_eq!(
+            app.status(),
+            Some("pane resizing is unavailable while only one pane is visible")
+        );
+    }
+
+    #[test]
+    fn invalid_layout_configuration_is_rejected_atomically() {
+        let mut app = App::new(page());
+        let original = app.layout_preferences().clone();
+        let active = crate::layout::LayoutPreferences {
+            mode: crate::layout::PaneMode::Three,
+            ..original.clone()
+        };
+        let invalid_baseline = crate::layout::LayoutPreferences {
+            two: [90, 10],
+            ..original.clone()
+        };
+
+        assert!(app.configure_layout(active, invalid_baseline).is_err());
+        assert_eq!(app.layout_preferences(), &original);
+    }
+
+    #[test]
+    fn layout_changes_preserve_loaded_reading_state() {
+        let mut app = App::new(page());
+        app.set_viewports(3, 2);
+        for _ in 0..5 {
+            let _ = app.handle_key(key(KeyCode::Down));
+        }
+        app.load_thread(Thread {
+            item: app.selected_item().cloned().expect("story selected"),
+            comments: vec![Comment {
+                id: 10,
+                children: vec![Comment {
+                    id: 11,
+                    ..Comment::default()
+                }],
+                ..Comment::default()
+            }],
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 43,
+        });
+        let _ = app.handle_key(key(KeyCode::Enter));
+        app.set_article(super::ArticleView::new(
+            "Article",
+            Some("https://example.com/article".to_owned()),
+            "one\ntwo\nthree\nfour\nfive\nsix",
+        ));
+        app.set_detail_metrics(2, 6);
+        let _ = app.handle_key(key(KeyCode::PageDown));
+
+        let story_id = app.selected_item().map(|item| item.id);
+        let story_offset = app.story_offset();
+        let comment_id = app.selected_comment().map(|comment| comment.id);
+        let comment_offset = app.comment_offset();
+        let article = app.article().cloned();
+        let detail_scroll = app.detail_scroll();
+
+        let _ = app.handle_key(key(KeyCode::Char('L')));
+        app.set_rendered_panes(
+            crate::layout::PaneSet::three(),
+            crate::layout::ResolvedMode::Three,
+        );
+        let _ = app.handle_key(alt_key(KeyCode::Char('l')));
+
+        assert_eq!(app.selected_item().map(|item| item.id), story_id);
+        assert_eq!(app.story_offset(), story_offset);
+        assert_eq!(app.selected_comment().map(|comment| comment.id), comment_id);
+        assert_eq!(app.comment_offset(), comment_offset);
+        assert!(app.is_comment_collapsed(10));
+        assert_eq!(app.article(), article.as_ref());
+        assert_eq!(app.detail_scroll(), detail_scroll);
+        assert_eq!(app.focus(), FocusPane::Detail);
     }
 
     #[test]
