@@ -291,6 +291,7 @@ fn story_row(
     selected: bool,
     theme: &Theme,
 ) -> ListItem<'static> {
+    const MARKER_WIDTH: usize = 3;
     let marker = match (bookmarked, read) {
         (true, true) => "★✓ ",
         (true, false) => "★  ",
@@ -304,9 +305,11 @@ fn story_row(
     } else {
         primary_style(theme, selected)
     };
+    let rank_prefix = format!("{rank:>rank_width$}. ");
+    let title_indent = " ".repeat(MARKER_WIDTH.saturating_add(rank_prefix.len()));
     let title = Line::from(vec![
-        Span::styled(format!("{rank:>rank_width$}. "), theme.muted_style()),
         Span::styled(marker, Style::default().fg(theme.warning)),
+        Span::styled(rank_prefix, theme.muted_style()),
         Span::styled(sanitize_single_line(item.display_title()), title_style),
     ]);
 
@@ -319,7 +322,10 @@ fn story_row(
     );
     let age = age(item.time);
     let mut metadata = vec![Span::styled(
-        format!("  {} pts · {} comments · ", item.score, item.descendants),
+        format!(
+            "{title_indent}{} pts · {} comments · ",
+            item.score, item.descendants
+        ),
         theme.muted_style(),
     )];
     metadata.push(Span::styled(author, primary_style(theme, selected)));
@@ -813,7 +819,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("Ctrl+U/D      half-page up/down"),
         Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
-        Line::raw("[/] or 1–6    switch feed · n/p next/previous page"),
+        Line::raw("[/] or 1–6    switch feed · n next page · p previous page"),
         Line::raw(""),
         Line::styled("Layout", theme.accent_style()),
         Line::raw("L             toggle two / three panes"),
@@ -824,32 +830,31 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("/             search Hacker News"),
         Line::raw("f             case-insensitive regex filter"),
         Line::raw("b / Space     toggle bookmark"),
-        Line::raw("m             mark read / unread"),
+        Line::raw("m             toggle selected story read / unread"),
         Line::raw("B             show only bookmarks"),
         Line::raw(""),
         Line::raw("a article · o browser · O offline · r refresh · ?/q close help"),
     ];
     let compact_help = vec![
         Line::styled("Navigation", theme.accent_style()),
-        Line::raw("j/k move · h/l pane · Tab cycle · n/p pages"),
+        Line::raw("j/k move · h/l pane · Tab cycle · n next · p previous"),
         Line::styled("Layout", theme.accent_style()),
         Line::raw("L toggle · Alt+h/l resize · Alt+0 reset"),
         Line::styled("Find and save", theme.accent_style()),
-        Line::raw("/ search · f filter · b save · m read · B saved only"),
+        Line::raw("/ search · f filter · b save · m read/unread · B saved"),
         Line::raw("a article · o browser · O offline · r refresh · q close"),
     ];
     let narrow_help = vec![
         Line::styled("?/q/Esc close", theme.accent_style()),
         Line::raw("Nav j/k h/l"),
-        Line::raw("Tab cycle"),
-        Line::raw("Enter open"),
+        Line::raw("Tab · Enter"),
         Line::raw("Layout L"),
         Line::raw("Resize Alt-h/l"),
         Line::raw("Find / f"),
         Line::raw("Save b B"),
         Line::raw("Read m"),
-        Line::raw("Read a o"),
-        Line::raw("More O r n/p"),
+        Line::raw("Read a o O r"),
+        Line::raw("n next p prev"),
     ];
     let help = if area.width < 40 {
         narrow_help
@@ -1244,7 +1249,12 @@ mod tests {
 
         assert_eq!(rank_y, title_y);
         assert_eq!(read_y, title_y);
-        assert!(rank_x < read_x && read_x < title_x);
+        assert!(read_x < rank_x && rank_x < title_x);
+        let rank_label_width = u16::try_from("1. ".len()).expect("rank label width fits u16");
+        assert_eq!(title_x, rank_x.saturating_add(rank_label_width));
+        let (points_x, points_y) = find_run(buffer, "123 pts");
+        assert_eq!(points_x, title_x);
+        assert_eq!(points_y, title_y.saturating_add(1));
         assert!(
             cells_for(buffer, "A carefully rendered story")
                 .all(|cell| cell.fg == Theme::classic().muted)
@@ -1803,7 +1813,15 @@ mod tests {
                     output
                 },
             );
-            for expected in ["Esc/?/q close", "Navigation", "Layout", "Find and save"] {
+            for expected in [
+                "Esc/?/q close",
+                "Navigation",
+                "Layout",
+                "Find and save",
+                "n next",
+                "p previous",
+                "m read/unread",
+            ] {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} at height {height}"
@@ -1832,7 +1850,14 @@ mod tests {
                     output
                 },
             );
-            for expected in ["?/q/Esc close", "Nav j/k", "Layout L", "Find / f"] {
+            for expected in [
+                "?/q/Esc close",
+                "Nav j/k",
+                "Layout L",
+                "Find / f",
+                "Read m",
+                "n next p prev",
+            ] {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} at width {width}"
@@ -1918,6 +1943,9 @@ mod tests {
                 });
         assert!(help.contains("Ctrl+U/D"));
         assert!(help.contains("PgUp/PgDn"));
+        assert!(help.contains("n next page"));
+        assert!(help.contains("p previous page"));
+        assert!(help.contains("toggle selected story read / unread"));
 
         let _ = app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('?'),
