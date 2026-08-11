@@ -1471,24 +1471,34 @@ async fn run_tui(
                 if let Some(message) = message {
                     match message {
                         UiMessage::Page { request_id, context, page_index, result }
-                            if request_id == page_request_id && context.matches(&app) => {
+                            if request_id == page_request_id => {
                                 page_task.take();
-                                match result {
-                                    Ok(page) if page_index == app.page_index() => app.refresh_page(page),
-                                    Ok(page) => app.set_page_at(page, page_index, DEFAULT_LIMIT),
-                                    Err(error) => app.set_error(error),
+                                if context.matches(&app) {
+                                    let selected_before = app.selected_item().map(|item| item.id);
+                                    match result {
+                                        Ok(page) if page_index == app.page_index() => app.refresh_page(page),
+                                        Ok(page) => app.set_page_at(page, page_index, DEFAULT_LIMIT),
+                                        Err(error) => app.set_error(error),
+                                    }
+                                    if selected_before != app.selected_item().map(|item| item.id) {
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
+                                    }
                                 }
                             }
                         UiMessage::Thread { request_id, item_id, result }
-                            if request_id == thread_request_id
-                                && app.selected_item().is_some_and(|item| item.id == item_id) => {
+                            if request_id == thread_request_id => {
                                 thread_task.take();
-                                match result {
-                                    Ok(thread) => {
-                                        app.load_thread(thread);
-                                        mark_read(&cache, &mut app, item_id);
+                                if app.selected_item().is_some_and(|item| item.id == item_id) {
+                                    match result {
+                                        Ok(thread) => {
+                                            app.load_thread(thread);
+                                            mark_read(&cache, &mut app, item_id);
+                                        }
+                                        Err(error) => app.set_error(error),
                                     }
-                                    Err(error) => app.set_error(error),
                                 }
                             }
                         UiMessage::Article {
@@ -1496,19 +1506,20 @@ async fn run_tui(
                             item_id,
                             title,
                             result,
-                        } if request_id == article_request_id
-                            && app.selected_item().is_some_and(|item| item.id == item_id) => {
+                        } if request_id == article_request_id => {
                             article_task.take();
-                            match result {
-                                Ok(article) => {
-                                    app.set_article(ArticleView::new(
-                                        title,
-                                        Some(article.url.to_string()),
-                                        article.text,
-                                    ));
-                                    mark_read(&cache, &mut app, item_id);
+                            if app.selected_item().is_some_and(|item| item.id == item_id) {
+                                match result {
+                                    Ok(article) => {
+                                        app.set_article(ArticleView::new(
+                                            title,
+                                            Some(article.url.to_string()),
+                                            article.text,
+                                        ));
+                                        mark_read(&cache, &mut app, item_id);
+                                    }
+                                    Err(error) => app.set_error(error),
                                 }
-                                Err(error) => app.set_error(error),
                             }
                         }
                         _ => {}
