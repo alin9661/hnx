@@ -1,7 +1,6 @@
 //! Command-line parsing, cache-first orchestration, and terminal lifecycle.
 
 use std::{
-    collections::BTreeSet,
     fs::OpenOptions,
     future::Future,
     io::{BufWriter, ErrorKind, Stdout, Write, stderr, stdout},
@@ -57,7 +56,6 @@ const ITEM_TTL: Duration = Duration::from_secs(60 * 60);
 const THREAD_TTL: Duration = Duration::from_secs(15 * 60);
 const SEARCH_TTL: Duration = Duration::from_secs(5 * 60);
 const LAYOUT_SETTING_KEY: &str = "layout.v1";
-const READ_SETTING_KEY: &str = "read.v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -168,7 +166,7 @@ enum CacheCommand {
     Stats,
     /// Remove expired network payloads while preserving local state.
     Prune,
-    /// Remove cached network payloads while preserving bookmarks/settings.
+    /// Remove cached network payloads while preserving bookmarks/read state/settings.
     Clear,
 }
 
@@ -537,6 +535,7 @@ fn run_cache_command(cache: &Cache, command: CacheCommand) -> Result<(), CliErro
                 writeln!(writer, "threads: {}", stats.threads)?;
                 writeln!(writer, "searches: {}", stats.searches)?;
                 writeln!(writer, "bookmarks: {}", stats.bookmarks)?;
+                writeln!(writer, "read items: {}", stats.read_items)?;
                 writeln!(writer, "settings: {}", stats.settings)?;
                 writeln!(writer, "stale entries: {}", stats.stale_entries)?;
                 writeln!(writer, "payload bytes: {}", stats.payload_bytes)?;
@@ -556,7 +555,7 @@ fn run_cache_command(cache: &Cache, command: CacheCommand) -> Result<(), CliErro
             write_stdout(|writer| {
                 writeln!(
                     writer,
-                    "cleared network cache; bookmarks and settings were preserved"
+                    "cleared network cache; bookmarks, read state, and settings were preserved"
                 )?;
                 Ok(())
             })
@@ -581,7 +580,8 @@ fn write_page(
         OutputFormat::Text => {
             write_stale_marker(writer, page.source, page.stale, page.fetched_at)?;
             for (index, item) in page.items.iter().enumerate() {
-                writeln!(writer, "{}", story_line(index + 1, item))?;
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                writeln!(writer, "{}", story_line(rank, item))?;
             }
             Ok(())
         }
@@ -1103,21 +1103,12 @@ async fn run_tui(
     let persistence_warning = persist_startup_layout(&cache, &layout);
     let layout_warning = combine_warnings(layout_warning, persistence_warning);
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
-    let (read_items, read_warning) = match cache.get_json_setting::<BTreeSet<u64>>(READ_SETTING_KEY)
-    {
-        Ok(items) => (items.unwrap_or_default(), None),
-        Err(error) => (
-            BTreeSet::new(),
-            Some(format!(
-                "Could not load read state; starting empty: {error}"
-            )),
-        ),
-    };
+    let read_items = cache.read_items()?;
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
         || App::empty(Feed::Top),
-        |entry| App::new(cache_page(entry, Some(DEFAULT_LIMIT))),
+        |entry| App::new(cache_page(entry, None)),
     );
     app.configure_layout(layout.active, layout.baseline)
         .map_err(|error| CliError::InvalidInput(error.to_string()))?;
@@ -1130,7 +1121,7 @@ async fn run_tui(
         }
     }
     let startup_warning = combine_warnings(theme_warning, layout_warning);
-    if let Some(warning) = combine_warnings(startup_warning, read_warning)
+    if let Some(warning) = startup_warning
         && app.error().is_none()
     {
         app.set_status(warning);
@@ -1156,7 +1147,7 @@ async fn run_tui(
             client.clone(),
             cache.clone(),
             Feed::Top,
-            DEFAULT_LIMIT,
+            refresh_limit(&app),
             0,
             page_request_id,
         ));
@@ -1206,13 +1197,6 @@ async fn run_tui(
                         if let Some(key) = key {
                             let selected_before = app.selected_item().map(|item| item.id);
                             let action = app.handle_key(key);
-                            let persist_reads = matches!(
-                                action,
-                                AppAction::LoadThread(_)
-                                    | AppAction::LoadArticle(_)
-                                    | AppAction::OpenStory(_)
-                                    | AppAction::ReadChanged { .. }
-                            );
                             let selected_after = app.selected_item().map(|item| item.id);
                             if selected_before != selected_after {
                                 thread_request_id = next_request_id(thread_request_id);
@@ -1222,7 +1206,7 @@ async fn run_tui(
                             }
 
                             match action {
-                                AppAction::None | AppAction::ReadChanged { .. } => {}
+                                AppAction::None => {}
                                 AppAction::Quit => quit = true,
                                 AppAction::LoadFeed(feed) => {
                                     page_request_id = next_request_id(page_request_id);
@@ -1234,7 +1218,7 @@ async fn run_tui(
                                     let cached = cache.get_feed_for_limit(feed, DEFAULT_LIMIT)?;
                                     let had_cache = cached.is_some();
                                     if let Some(entry) = cached {
-                                        app.load_page(cache_page(entry, Some(DEFAULT_LIMIT)));
+                                        app.load_page(cache_page(entry, None));
                                     }
                                     if app.offline() {
                                         if !had_cache {
@@ -1242,9 +1226,10 @@ async fn run_tui(
                                         }
                                     } else {
                                         app.set_loading(true);
+                                        let limit = refresh_limit(&app);
                                         page_task = Some(spawn_feed(
                                             sender.clone(), client.clone(), cache.clone(), feed,
-                                            DEFAULT_LIMIT, 0, page_request_id,
+                                            limit, 0, page_request_id,
                                         ));
                                     }
                                 }
@@ -1263,7 +1248,7 @@ async fn run_tui(
                                         let cached = cache.get_search_for_limit(&key, DEFAULT_LIMIT)?;
                                         let had_cache = cached.is_some();
                                         if let Some(entry) = cached {
-                                            app.load_page(cache_page(entry, Some(DEFAULT_LIMIT)));
+                                            app.load_page(cache_page(entry, None));
                                         }
                                         if app.offline() {
                                             if !had_cache {
@@ -1271,9 +1256,10 @@ async fn run_tui(
                                             }
                                         } else {
                                             app.set_loading(true);
+                                            let limit = refresh_limit(&app);
                                             page_task = Some(spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, 0, page_request_id,
+                                                limit, 0, page_request_id,
                                             ));
                                         }
                                     }
@@ -1286,7 +1272,7 @@ async fn run_tui(
                                     } else {
                                         app.set_loading(true);
                                         let page_index = app.page_index();
-                                        let limit = page_limit(page_index).unwrap_or(MAX_LIMIT);
+                                        let limit = refresh_limit(&app);
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
@@ -1304,7 +1290,11 @@ async fn run_tui(
                                     let target_page = app.page_index().saturating_add(1);
                                     if let Some(limit) = page_limit(target_page) {
                                         page_request_id = next_request_id(page_request_id);
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
                                         abort_task(&mut page_task);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
                                         let cached = if let Some(query) = app.search_query() {
                                             cache.get_search_for_limit(&tui_search_key(query), limit)?
                                         } else {
@@ -1313,7 +1303,7 @@ async fn run_tui(
                                         let had_cache = cached.is_some();
                                         if let Some(entry) = cached {
                                             app.set_page_at(
-                                                cache_page(entry, Some(limit)),
+                                                cache_page(entry, None),
                                                 target_page,
                                                 DEFAULT_LIMIT,
                                             );
@@ -1345,7 +1335,11 @@ async fn run_tui(
                                 }
                                 AppAction::PreviousPage => {
                                     page_request_id = next_request_id(page_request_id);
+                                    thread_request_id = next_request_id(thread_request_id);
+                                    article_request_id = next_request_id(article_request_id);
                                     abort_task(&mut page_task);
+                                    abort_task(&mut thread_task);
+                                    abort_task(&mut article_task);
                                     if app.page_index() == 0 {
                                         app.set_status("Already on the first page");
                                     } else {
@@ -1361,6 +1355,7 @@ async fn run_tui(
                                     let had_cache = cached.is_some();
                                     if let Some(entry) = cached {
                                         app.load_thread(cache_thread(entry));
+                                        mark_read(&cache, &mut app, item_id);
                                     }
                                     if app.offline() {
                                         if !had_cache {
@@ -1389,7 +1384,11 @@ async fn run_tui(
                                         }
                                     }
                                 }
-                                AppAction::OpenStory(item_id) => handle_open_story(&mut app, item_id),
+                                AppAction::OpenStory(item_id) => {
+                                    if handle_open_story(&mut app, item_id) {
+                                        mark_read(&cache, &mut app, item_id);
+                                    }
+                                }
                                 AppAction::SetOffline(is_offline) => {
                                     if is_offline {
                                         page_request_id = next_request_id(page_request_id);
@@ -1402,7 +1401,7 @@ async fn run_tui(
                                         page_request_id = next_request_id(page_request_id);
                                         app.set_loading(true);
                                         let page_index = app.page_index();
-                                        let limit = page_limit(page_index).unwrap_or(MAX_LIMIT);
+                                        let limit = refresh_limit(&app);
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
@@ -1431,6 +1430,9 @@ async fn run_tui(
                                         app.set_error(format!("Could not update bookmark: {error}"));
                                     }
                                 }
+                                AppAction::ReadChanged { item_id, read } => {
+                                    persist_read(&cache, &mut app, item_id, read);
+                                }
                                 AppAction::LayoutChanged(layout) => {
                                     let action = AppAction::LayoutChanged(layout);
                                     if let Err(error) = persist_layout_action(&cache, &action) {
@@ -1441,18 +1443,6 @@ async fn run_tui(
                                     if let Err(error) = persist_layout_action(&cache, &AppAction::LayoutReset) {
                                         app.set_status(format!("Layout reset but saved override remains: {error}"));
                                     }
-                                }
-                            }
-                            if persist_reads
-                                && let Err(error) =
-                                    cache.set_json_setting(READ_SETTING_KEY, app.read_items())
-                            {
-                                if app.error().is_none() {
-                                    app.set_status(format!(
-                                        "Read state changed but was not saved: {error}"
-                                    ));
-                                } else {
-                                    tracing::warn!(%error, "could not persist read state");
                                 }
                             }
                             redraw = true;
@@ -1479,7 +1469,10 @@ async fn run_tui(
                                 && app.selected_item().is_some_and(|item| item.id == item_id) => {
                                 thread_task.take();
                                 match result {
-                                    Ok(thread) => app.load_thread(thread),
+                                    Ok(thread) => {
+                                        app.load_thread(thread);
+                                        mark_read(&cache, &mut app, item_id);
+                                    }
                                     Err(error) => app.set_error(error),
                                 }
                             }
@@ -1492,11 +1485,14 @@ async fn run_tui(
                             && app.selected_item().is_some_and(|item| item.id == item_id) => {
                             article_task.take();
                             match result {
-                                Ok(article) => app.set_article(ArticleView::new(
-                                    title,
-                                    Some(article.url.to_string()),
-                                    article.text,
-                                )),
+                                Ok(article) => {
+                                    app.set_article(ArticleView::new(
+                                        title,
+                                        Some(article.url.to_string()),
+                                        article.text,
+                                    ));
+                                    mark_read(&cache, &mut app, item_id);
+                                }
                                 Err(error) => app.set_error(error),
                             }
                         }
@@ -1515,6 +1511,8 @@ async fn run_tui(
                 quit = true;
             }
         }
+
+        app.set_loading(page_task.is_some() || thread_task.is_some() || article_task.is_some());
 
         if redraw && !quit {
             terminal.draw(&mut app, &theme)?;
@@ -1647,13 +1645,20 @@ fn page_limit(page_index: usize) -> Option<usize> {
     (start < MAX_LIMIT).then(|| start.saturating_add(DEFAULT_LIMIT).min(MAX_LIMIT))
 }
 
+fn refresh_limit(app: &App) -> usize {
+    page_limit(app.page_index())
+        .unwrap_or(MAX_LIMIT)
+        .max(app.loaded_story_slots())
+        .min(MAX_LIMIT)
+}
+
 fn abort_task(task: &mut Option<JoinHandle<()>>) {
     if let Some(task) = task.take() {
         task.abort();
     }
 }
 
-fn open_story(app: &mut App, item_id: u64) {
+fn open_story(app: &mut App, item_id: u64) -> bool {
     let item = app.stories().iter().find(|item| item.id == item_id);
     let external = item
         .and_then(|item| item.url.as_deref())
@@ -1664,17 +1669,40 @@ fn open_story(app: &mut App, item_id: u64) {
     );
     if let Err(error) = open::that(&target) {
         app.set_error(format!("Could not open browser: {error}"));
+        false
     } else {
         app.set_status(format!("Opened {target}"));
+        true
     }
 }
 
-fn handle_open_story(app: &mut App, item_id: u64) {
+fn handle_open_story(app: &mut App, item_id: u64) -> bool {
     if app.offline() {
         app.set_error("Opening URLs is unavailable in offline mode");
+        false
     } else {
-        open_story(app, item_id);
+        open_story(app, item_id)
     }
+}
+
+fn persist_read(cache: &Cache, app: &mut App, item_id: u64, read: bool) {
+    let result = if read {
+        cache.set_read(item_id)
+    } else {
+        cache.remove_read(item_id).map(|_| ())
+    };
+    if let Err(error) = result {
+        if app.error().is_none() {
+            app.set_status(format!("Read state changed but was not saved: {error}"));
+        } else {
+            tracing::warn!(%error, "could not persist read state");
+        }
+    }
+}
+
+fn mark_read(cache: &Cache, app: &mut App, item_id: u64) {
+    app.set_read(item_id, true);
+    persist_read(cache, app, item_id, true);
 }
 
 fn resolve_theme(cache: &Cache, requested: Option<&str>) -> (Theme, Option<String>) {
@@ -1735,7 +1763,6 @@ fn resolve_theme(cache: &Cache, requested: Option<&str>) -> (Theme, Option<Strin
 mod tests {
     use std::{
         cell::Cell,
-        collections::BTreeSet,
         io::{self, ErrorKind, Write},
         mem::ManuallyDrop,
         sync::atomic::AtomicBool,
@@ -1745,9 +1772,9 @@ mod tests {
 
     use super::{
         CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
-        READ_SETTING_KEY, apply_requested_layout, cleanup_once, combine_warnings,
-        config_input_error, handle_open_story, next_request_id, page_limit, parse_item_id,
-        parse_limit, parse_search_query, persist_layout_action, write_buffered, write_comments,
+        apply_requested_layout, cleanup_once, combine_warnings, config_input_error,
+        handle_open_story, next_request_id, page_limit, parse_item_id, parse_limit,
+        parse_search_query, persist_layout_action, refresh_limit, write_buffered, write_comments,
         write_item, write_json, write_page, write_thread,
     };
     use crate::{
@@ -1833,19 +1860,13 @@ mod tests {
     }
 
     #[test]
-    fn read_state_round_trips_through_sqlite_settings() {
+    fn read_state_round_trips_through_keyed_sqlite_rows() {
         let cache = Cache::open_in_memory().expect("cache opens");
-        let read = BTreeSet::from([42_u64, 99]);
-        cache
-            .set_json_setting(READ_SETTING_KEY, &read)
-            .expect("read state persists");
-
-        assert_eq!(
-            cache
-                .get_json_setting::<BTreeSet<u64>>(READ_SETTING_KEY)
-                .expect("read state loads"),
-            Some(read)
-        );
+        cache.set_read(42).expect("first read state persists");
+        cache.set_read(99).expect("second read state persists");
+        assert_eq!(cache.read_items().expect("read state loads"), vec![42, 99]);
+        assert!(cache.remove_read(42).expect("read state removes"));
+        assert_eq!(cache.read_items().expect("read state reloads"), vec![99]);
     }
 
     #[test]
@@ -1961,6 +1982,30 @@ mod tests {
         assert_eq!(page_limit(16), Some(500));
         assert_eq!(page_limit(17), None);
         assert_eq!(page_limit(usize::MAX), None);
+    }
+
+    #[test]
+    fn refresh_retains_the_largest_loaded_prefix() {
+        let mut page = StoryPage {
+            feed: Feed::Top,
+            query: None,
+            items: (1..=60)
+                .map(|rank| Item {
+                    id: rank,
+                    rank: Some(usize::try_from(rank).expect("rank fits")),
+                    ..Item::default()
+                })
+                .collect(),
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        };
+        let mut app = App::new(page.clone());
+        assert_eq!(refresh_limit(&app), 60);
+
+        page.items.truncate(30);
+        app.refresh_page(page);
+        assert_eq!(refresh_limit(&app), 30);
     }
 
     #[test]
