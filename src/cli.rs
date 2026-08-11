@@ -1092,10 +1092,10 @@ async fn run_tui(
     config_path: Option<&Path>,
     layout_override: Option<&LayoutOverride>,
 ) -> Result<(), CliError> {
-    let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
     let (layout, layout_warning) = resolve_cached_layout(&cache, config_path, layout_override)?;
     let persistence_warning = persist_startup_layout(&cache, &layout);
     let layout_warning = combine_warnings(layout_warning, persistence_warning);
+    let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(

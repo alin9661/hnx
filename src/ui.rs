@@ -152,11 +152,17 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             }
         })
         .collect();
+    let query_label = app
+        .search_query()
+        .map(|query| format!(" · “{}” ", sanitize_single_line(query)));
     let full_width = brand.chars().count()
         + labels
             .iter()
             .map(|label| label.chars().count())
-            .sum::<usize>();
+            .sum::<usize>()
+        + query_label
+            .as_ref()
+            .map_or(0, |query| query.chars().count());
     let visible_labels: Vec<_> = if full_width <= usize::from(area.width) {
         labels.iter().enumerate().collect()
     } else {
@@ -171,11 +177,8 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         };
         spans.push(Span::styled(label.clone(), style));
     }
-    if let Some(query) = app.search_query() {
-        spans.push(Span::styled(
-            format!(" · “{}” ", sanitize_single_line(query)),
-            masthead_style,
-        ));
+    if let Some(query) = query_label {
+        spans.push(Span::styled(query, masthead_style));
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(masthead_style),
@@ -1094,11 +1097,12 @@ mod tests {
     }
 
     #[test]
-    fn narrow_masthead_keeps_the_active_feed_visible() {
+    fn narrow_masthead_keeps_the_active_feed_and_search_visible() {
         let backend = TestBackend::new(50, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut jobs_page = page();
         jobs_page.feed = Feed::Jobs;
+        jobs_page.query = Some("rust".to_owned());
         let mut app = App::new(jobs_page);
         terminal
             .draw(|frame| render(frame, &mut app, &Theme::classic()))
@@ -1110,6 +1114,7 @@ mod tests {
         }));
         assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
         assert!(find_run(buffer, "hnx").0 < find_run(buffer, "Jobs").0);
+        assert!(find_run(buffer, "rust").0 > find_run(buffer, "Jobs").0);
     }
 
     #[test]
