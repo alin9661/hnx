@@ -1072,13 +1072,20 @@ fn migrate_legacy_read_setting(transaction: &Transaction<'_>) -> CacheResult<()>
         return Ok(());
     };
     let read_at = current_timestamp();
+    let mut fully_imported = true;
     for id in ids {
+        let Ok(id) = sqlite_id(id) else {
+            fully_imported = false;
+            continue;
+        };
         transaction.execute(
             "INSERT OR IGNORE INTO read_items (item_id, read_at) VALUES (?1, ?2)",
-            params![sqlite_id(id)?, read_at],
+            params![id, read_at],
         )?;
     }
-    transaction.execute("DELETE FROM settings WHERE key = 'read.v1'", [])?;
+    if fully_imported {
+        transaction.execute("DELETE FROM settings WHERE key = 'read.v1'", [])?;
+    }
     Ok(())
 }
 
@@ -1722,6 +1729,57 @@ mod tests {
         assert_eq!(
             cache.get_setting("read.v1").expect("legacy setting checks"),
             None
+        );
+    }
+
+    #[test]
+    fn version_four_migration_preserves_unsupported_legacy_read_ids() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("v4-out-of-range.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database opens");
+        let legacy = "[42,18446744073709551615]";
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE feeds (
+                     feed TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE searches (
+                     query TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE read_items (
+                     item_id INTEGER PRIMARY KEY NOT NULL,
+                     read_at INTEGER NOT NULL
+                 );
+                 INSERT INTO settings (key, value, updated_at)
+                     VALUES ('read.v1', '[42,18446744073709551615]', 1);
+                 PRAGMA user_version = 4;",
+            )
+            .expect("legacy schema creates");
+        drop(connection);
+
+        let cache = Cache::open(&path).expect("legacy database migrates");
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
+        assert_eq!(cache.read_items().expect("valid state imports"), vec![42]);
+        assert_eq!(
+            cache.get_setting("read.v1").expect("legacy setting checks"),
+            Some(legacy.to_owned())
         );
     }
 
