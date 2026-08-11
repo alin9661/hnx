@@ -111,7 +111,8 @@ case-insensitive regex filter, `b` bookmarks, `a` reads an article in-terminal,
 next/previous 30-story page. Opening a story marks it read; `m` toggles
 read/unread, and read state persists across launches. `?` opens help, and `q`
 quits or closes help. The status line always identifies offline/stale/partial
-data and its source. Comment bodies reflow to the live thread-pane width.
+data and its source. Story titles and comment bodies reflow to their live pane
+widths; compact rank and marker gutters keep points aligned beneath each title.
 
 The default `classic` theme uses Y Combinator orange (`#FF6600`) and Hacker
 News cream (`#F7F6F0`). `midnight`, an ANSI 16-color theme, `NO_COLOR`, and
@@ -149,8 +150,8 @@ cargo bench
 Project guides: [architecture](docs/ARCHITECTURE.md),
 [dependencies](docs/DEPENDENCIES.md), [performance](docs/PERFORMANCE.md),
 [themes](docs/THEMES.md), [releasing](docs/RELEASING.md),
-[contributing](CONTRIBUTING.md), the [security policy](SECURITY.md), and the
-[changelog](CHANGELOG.md).
+[contributing](CONTRIBUTING.md), [follow-up work](TODOS.md), the [security
+policy](SECURITY.md), and the [changelog](CHANGELOG.md).
 
 ## Provenance and naming
 
