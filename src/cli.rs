@@ -1,6 +1,7 @@
 //! Command-line parsing, cache-first orchestration, and terminal lifecycle.
 
 use std::{
+    collections::BTreeSet,
     fs::OpenOptions,
     future::Future,
     io::{BufWriter, ErrorKind, Stdout, Write, stderr, stdout},
@@ -27,7 +28,11 @@ use futures::StreamExt as _;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{MissedTickBehavior, interval},
+};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -52,6 +57,7 @@ const ITEM_TTL: Duration = Duration::from_secs(60 * 60);
 const THREAD_TTL: Duration = Duration::from_secs(15 * 60);
 const SEARCH_TTL: Duration = Duration::from_secs(5 * 60);
 const LAYOUT_SETTING_KEY: &str = "layout.v1";
+const READ_SETTING_KEY: &str = "read.v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -868,6 +874,7 @@ enum UiMessage {
     Page {
         request_id: u64,
         context: PageContext,
+        page_index: usize,
         result: Result<StoryPage, String>,
     },
     Thread {
@@ -1096,6 +1103,16 @@ async fn run_tui(
     let persistence_warning = persist_startup_layout(&cache, &layout);
     let layout_warning = combine_warnings(layout_warning, persistence_warning);
     let (theme, theme_warning) = resolve_theme(&cache, requested_theme);
+    let (read_items, read_warning) = match cache.get_json_setting::<BTreeSet<u64>>(READ_SETTING_KEY)
+    {
+        Ok(items) => (items.unwrap_or_default(), None),
+        Err(error) => (
+            BTreeSet::new(),
+            Some(format!(
+                "Could not load read state; starting empty: {error}"
+            )),
+        ),
+    };
     let cached = cache.get_feed_for_limit(Feed::Top, DEFAULT_LIMIT)?;
     let had_cached_page = cached.is_some();
     let mut app = cached.map_or_else(
@@ -1105,13 +1122,15 @@ async fn run_tui(
     app.configure_layout(layout.active, layout.baseline)
         .map_err(|error| CliError::InvalidInput(error.to_string()))?;
     app.set_bookmarks(cache.bookmarks()?.into_iter().map(|item| item.id));
+    app.set_read_items(read_items);
     if offline {
         app.set_offline(true);
         if !had_cached_page {
             app.set_error("No cached top feed is available offline");
         }
     }
-    if let Some(warning) = combine_warnings(theme_warning, layout_warning)
+    let startup_warning = combine_warnings(theme_warning, layout_warning);
+    if let Some(warning) = combine_warnings(startup_warning, read_warning)
         && app.error().is_none()
     {
         app.set_status(warning);
@@ -1138,6 +1157,7 @@ async fn run_tui(
             cache.clone(),
             Feed::Top,
             DEFAULT_LIMIT,
+            0,
             page_request_id,
         ));
     }
@@ -1149,11 +1169,16 @@ async fn run_tui(
     let mut events = EventStream::new();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut animation = interval(Duration::from_millis(90));
+    animation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut quit = false;
 
     while !quit {
         let mut redraw = false;
         tokio::select! {
+            _ = animation.tick(), if app.loading() => {
+                redraw = app.advance_loading_animation();
+            }
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Resize(_, _) | Event::FocusGained | Event::FocusLost)) => {
@@ -1181,6 +1206,13 @@ async fn run_tui(
                         if let Some(key) = key {
                             let selected_before = app.selected_item().map(|item| item.id);
                             let action = app.handle_key(key);
+                            let persist_reads = matches!(
+                                action,
+                                AppAction::LoadThread(_)
+                                    | AppAction::LoadArticle(_)
+                                    | AppAction::OpenStory(_)
+                                    | AppAction::ReadChanged { .. }
+                            );
                             let selected_after = app.selected_item().map(|item| item.id);
                             if selected_before != selected_after {
                                 thread_request_id = next_request_id(thread_request_id);
@@ -1190,7 +1222,7 @@ async fn run_tui(
                             }
 
                             match action {
-                                AppAction::None => {}
+                                AppAction::None | AppAction::ReadChanged { .. } => {}
                                 AppAction::Quit => quit = true,
                                 AppAction::LoadFeed(feed) => {
                                     page_request_id = next_request_id(page_request_id);
@@ -1212,7 +1244,7 @@ async fn run_tui(
                                         app.set_loading(true);
                                         page_task = Some(spawn_feed(
                                             sender.clone(), client.clone(), cache.clone(), feed,
-                                            DEFAULT_LIMIT, page_request_id,
+                                            DEFAULT_LIMIT, 0, page_request_id,
                                         ));
                                     }
                                 }
@@ -1241,7 +1273,7 @@ async fn run_tui(
                                             app.set_loading(true);
                                             page_task = Some(spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                DEFAULT_LIMIT, 0, page_request_id,
                                             ));
                                         }
                                     }
@@ -1253,17 +1285,71 @@ async fn run_tui(
                                         app.set_error("Refresh is unavailable in offline mode");
                                     } else {
                                         app.set_loading(true);
+                                        let page_index = app.page_index();
+                                        let limit = page_limit(page_index).unwrap_or(MAX_LIMIT);
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         } else {
                                             spawn_feed(
                                                 sender.clone(), client.clone(), cache.clone(), app.feed(),
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         });
+                                    }
+                                }
+                                AppAction::NextPage => {
+                                    let target_page = app.page_index().saturating_add(1);
+                                    if let Some(limit) = page_limit(target_page) {
+                                        page_request_id = next_request_id(page_request_id);
+                                        abort_task(&mut page_task);
+                                        let cached = if let Some(query) = app.search_query() {
+                                            cache.get_search_for_limit(&tui_search_key(query), limit)?
+                                        } else {
+                                            cache.get_feed_for_limit(app.feed(), limit)?
+                                        };
+                                        let had_cache = cached.is_some();
+                                        if let Some(entry) = cached {
+                                            app.set_page_at(
+                                                cache_page(entry, Some(limit)),
+                                                target_page,
+                                                DEFAULT_LIMIT,
+                                            );
+                                        }
+                                        if app.offline() {
+                                            if !had_cache {
+                                                app.set_error(format!(
+                                                    "Page {} is not cached",
+                                                    target_page.saturating_add(1)
+                                                ));
+                                            }
+                                        } else {
+                                            app.set_loading(true);
+                                            page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
+                                                spawn_search(
+                                                    sender.clone(), client.clone(), cache.clone(), query,
+                                                    limit, target_page, page_request_id,
+                                                )
+                                            } else {
+                                                spawn_feed(
+                                                    sender.clone(), client.clone(), cache.clone(), app.feed(),
+                                                    limit, target_page, page_request_id,
+                                                )
+                                            });
+                                        }
+                                    } else {
+                                        app.set_error("No more pages are available");
+                                    }
+                                }
+                                AppAction::PreviousPage => {
+                                    page_request_id = next_request_id(page_request_id);
+                                    abort_task(&mut page_task);
+                                    if app.page_index() == 0 {
+                                        app.set_status("Already on the first page");
+                                    } else {
+                                        let _ = app.show_page(app.page_index().saturating_sub(1));
                                     }
                                 }
                                 AppAction::LoadThread(item_id) => {
@@ -1315,15 +1401,17 @@ async fn run_tui(
                                     } else {
                                         page_request_id = next_request_id(page_request_id);
                                         app.set_loading(true);
+                                        let page_index = app.page_index();
+                                        let limit = page_limit(page_index).unwrap_or(MAX_LIMIT);
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         } else {
                                             spawn_feed(
                                                 sender.clone(), client.clone(), cache.clone(), app.feed(),
-                                                DEFAULT_LIMIT, page_request_id,
+                                                limit, page_index, page_request_id,
                                             )
                                         });
                                     }
@@ -1355,6 +1443,18 @@ async fn run_tui(
                                     }
                                 }
                             }
+                            if persist_reads
+                                && let Err(error) =
+                                    cache.set_json_setting(READ_SETTING_KEY, app.read_items())
+                            {
+                                if app.error().is_none() {
+                                    app.set_status(format!(
+                                        "Read state changed but was not saved: {error}"
+                                    ));
+                                } else {
+                                    tracing::warn!(%error, "could not persist read state");
+                                }
+                            }
                             redraw = true;
                         }
                     }
@@ -1365,11 +1465,12 @@ async fn run_tui(
             message = receiver.recv() => {
                 if let Some(message) = message {
                     match message {
-                        UiMessage::Page { request_id, context, result }
+                        UiMessage::Page { request_id, context, page_index, result }
                             if request_id == page_request_id && context.matches(&app) => {
                                 page_task.take();
                                 match result {
-                                    Ok(page) => app.refresh_page(page),
+                                    Ok(page) if page_index == app.page_index() => app.refresh_page(page),
+                                    Ok(page) => app.set_page_at(page, page_index, DEFAULT_LIMIT),
                                     Err(error) => app.set_error(error),
                                 }
                             }
@@ -1432,6 +1533,7 @@ fn spawn_feed(
     cache: Cache,
     feed: Feed,
     limit: usize,
+    page_index: usize,
     request_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1447,6 +1549,7 @@ fn spawn_feed(
         let _ = sender.send(UiMessage::Page {
             request_id,
             context: PageContext::Feed(feed),
+            page_index,
             result,
         });
     })
@@ -1458,6 +1561,7 @@ fn spawn_search(
     cache: Cache,
     query: String,
     limit: usize,
+    page_index: usize,
     request_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1473,6 +1577,7 @@ fn spawn_search(
         let _ = sender.send(UiMessage::Page {
             request_id,
             context: PageContext::Search(query),
+            page_index,
             result,
         });
     })
@@ -1535,6 +1640,11 @@ fn tui_search_key(query: &str) -> String {
 
 fn next_request_id(request_id: u64) -> u64 {
     request_id.wrapping_add(1).max(1)
+}
+
+fn page_limit(page_index: usize) -> Option<usize> {
+    let start = page_index.checked_mul(DEFAULT_LIMIT)?;
+    (start < MAX_LIMIT).then(|| start.saturating_add(DEFAULT_LIMIT).min(MAX_LIMIT))
 }
 
 fn abort_task(task: &mut Option<JoinHandle<()>>) {
@@ -1625,6 +1735,7 @@ fn resolve_theme(cache: &Cache, requested: Option<&str>) -> (Theme, Option<Strin
 mod tests {
     use std::{
         cell::Cell,
+        collections::BTreeSet,
         io::{self, ErrorKind, Write},
         mem::ManuallyDrop,
         sync::atomic::AtomicBool,
@@ -1634,10 +1745,10 @@ mod tests {
 
     use super::{
         CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
-        apply_requested_layout, cleanup_once, combine_warnings, config_input_error,
-        handle_open_story, next_request_id, parse_item_id, parse_limit, parse_search_query,
-        persist_layout_action, write_buffered, write_comments, write_item, write_json, write_page,
-        write_thread,
+        READ_SETTING_KEY, apply_requested_layout, cleanup_once, combine_warnings,
+        config_input_error, handle_open_story, next_request_id, page_limit, parse_item_id,
+        parse_limit, parse_search_query, persist_layout_action, write_buffered, write_comments,
+        write_item, write_json, write_page, write_thread,
     };
     use crate::{
         api::SearchType,
@@ -1718,6 +1829,22 @@ mod tests {
                 .get_setting(LAYOUT_SETTING_KEY)
                 .expect("setting reads"),
             None
+        );
+    }
+
+    #[test]
+    fn read_state_round_trips_through_sqlite_settings() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let read = BTreeSet::from([42_u64, 99]);
+        cache
+            .set_json_setting(READ_SETTING_KEY, &read)
+            .expect("read state persists");
+
+        assert_eq!(
+            cache
+                .get_json_setting::<BTreeSet<u64>>(READ_SETTING_KEY)
+                .expect("read state loads"),
+            Some(read)
         );
     }
 
@@ -1824,6 +1951,16 @@ mod tests {
         assert!(parse_limit("0").is_err());
         assert!(parse_limit("501").is_err());
         assert_eq!(parse_limit("500"), Ok(500));
+    }
+
+    #[test]
+    fn tui_page_limits_grow_by_thirty_and_stop_at_the_api_cap() {
+        assert_eq!(page_limit(0), Some(30));
+        assert_eq!(page_limit(1), Some(60));
+        assert_eq!(page_limit(15), Some(480));
+        assert_eq!(page_limit(16), Some(500));
+        assert_eq!(page_limit(17), None);
+        assert_eq!(page_limit(usize::MAX), None);
     }
 
     #[test]
