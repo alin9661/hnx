@@ -1043,6 +1043,10 @@ fn migrate_connection(connection: &mut Connection) -> CacheResult<()> {
                  ADD COLUMN available_count INTEGER NOT NULL DEFAULT 0 CHECK(available_count >= 0);",
         )?;
         backfill_available_counts(&transaction)?;
+        // Early builds of this branch created schema v4 before the legacy
+        // read-setting import was added. Re-running the idempotent import here
+        // repairs those databases while v5 is still the shipping migration.
+        migrate_legacy_read_setting(&transaction)?;
         record_migration(&transaction, 5)?;
         transaction.execute_batch("PRAGMA user_version = 5;")?;
     }
@@ -1652,6 +1656,59 @@ mod tests {
                  INSERT INTO settings (key, value, updated_at)
                      VALUES ('read.v1', '[42,99]', 1);
                  PRAGMA user_version = 3;",
+            )
+            .expect("legacy schema creates");
+        drop(connection);
+
+        let cache = Cache::open(&path).expect("legacy database migrates");
+        assert_eq!(cache.schema_version().expect("version reads"), 5);
+        assert_eq!(
+            cache.read_items().expect("read state imports"),
+            vec![42, 99]
+        );
+        assert_eq!(
+            cache.get_setting("read.v1").expect("legacy setting checks"),
+            None
+        );
+    }
+
+    #[test]
+    fn version_four_migration_repairs_legacy_read_state() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("v4.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE feeds (
+                     feed TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE searches (
+                     query TEXT PRIMARY KEY NOT NULL,
+                     payload BLOB NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     item_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE settings (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE read_items (
+                     item_id INTEGER PRIMARY KEY NOT NULL,
+                     read_at INTEGER NOT NULL
+                 );
+                 INSERT INTO settings (key, value, updated_at)
+                     VALUES ('read.v1', '[42,99]', 1);
+                 PRAGMA user_version = 4;",
             )
             .expect("legacy schema creates");
         drop(connection);
