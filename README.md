@@ -148,7 +148,8 @@ cargo bench
 ```
 
 Project guides: [architecture](docs/ARCHITECTURE.md),
-[dependencies](docs/DEPENDENCIES.md), [performance](docs/PERFORMANCE.md),
+[cache design](docs/CACHING.md), [dependencies](docs/DEPENDENCIES.md),
+[performance](docs/PERFORMANCE.md),
 [themes](docs/THEMES.md), [releasing](docs/RELEASING.md),
 [contributing](CONTRIBUTING.md), [follow-up work](TODOS.md), the [security
 policy](SECURITY.md), and the [changelog](CHANGELOG.md).

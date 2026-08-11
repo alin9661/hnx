@@ -8,7 +8,9 @@
    deadline, response-size, and concurrency limits.
 2. `cache` persists normalized payloads, freshness metadata, bookmarks, and
    per-story read rows in SQLite. Canonical feed ranks survive missing upstream
-   records so pagination never compresses or renumbers later slots.
+   records so pagination never compresses or renumbers later slots. The
+   [cache decision record](CACHING.md) explains the workload, alternatives,
+   Redis/Valkey tradeoffs, and conditions that would justify a different store.
 3. `config` and `layout` validate preferences, resolve precedence, and compute
    responsive rectangles without terminal or database side effects.
 4. `app` is a deterministic state machine. It does not perform terminal or
