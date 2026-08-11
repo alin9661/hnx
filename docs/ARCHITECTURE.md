@@ -6,7 +6,9 @@
    identity/order; Algolia supplies batched records, and bounded Firebase
    requests reconcile gaps. Threads are traversed with cycle, depth, node,
    deadline, response-size, and concurrency limits.
-2. `cache` persists normalized payloads and freshness metadata in SQLite.
+2. `cache` persists normalized payloads and freshness metadata in SQLite. The
+   [cache decision record](CACHING.md) explains the workload, alternatives,
+   Redis/Valkey tradeoffs, and conditions that would justify a different store.
 3. `app` is a deterministic state machine. It does not perform terminal I/O.
 4. `ui` renders `app` state into adaptive Ratatui layouts and records rendered
    viewport/content metrics back into `App` so Detail scrolling stays bounded

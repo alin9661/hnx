@@ -59,3 +59,20 @@ thread construction so the result tracks steady-state interaction latency.
 Measure end-to-end commands using a warm and cold cache separately. Network
 results must report region, connection type, sample count, p50, and p95; a
 single favorable observation is not a benchmark.
+
+Reproduce the 100-process warm offline observation after populating Top once:
+
+```bash
+cargo build --release
+./target/release/hnx feed top --limit 30 --format json >/dev/null
+/usr/bin/time -p sh -c '
+  count=0
+  while [ "$count" -lt 100 ]; do
+    ./target/release/hnx --offline feed top --limit 30 --format json >/dev/null || exit 1
+    count=$((count + 1))
+  done
+'
+```
+
+Divide the reported `real` seconds by 100. Record the operating system, CPU,
+cache contents, and at least five runs before comparing releases.
