@@ -168,10 +168,18 @@ pub fn resolve_layout(
     Ok(LayoutResolution {
         active,
         baseline,
-        warning: stored_warning.or(config_warning),
+        warning: combine_warnings(stored_warning, config_warning),
         persist_cli,
         reset_saved: false,
     })
+}
+
+fn combine_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (None, None) => None,
+    }
 }
 
 fn load_baseline(
@@ -400,6 +408,17 @@ mod tests {
             .expect("stored validation failure is recoverable");
         assert_eq!(result.active.two, [40, 60]);
         assert!(result.warning.is_some());
+    }
+
+    #[test]
+    fn simultaneous_fallback_causes_share_one_warning_without_information_loss() {
+        let warning = combine_warnings(
+            Some("saved layout invalid".to_owned()),
+            Some("auto config invalid".to_owned()),
+        )
+        .expect("combined warning");
+
+        assert_eq!(warning, "saved layout invalid; auto config invalid");
     }
 
     #[test]

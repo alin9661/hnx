@@ -162,7 +162,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             .sum::<usize>()
         + query_label
             .as_ref()
-            .map_or(0, |query| query.chars().count());
+            .map_or(0, |query| Span::raw(query.as_str()).width());
     let visible_labels: Vec<_> = if full_width <= usize::from(area.width) {
         labels.iter().enumerate().collect()
     } else {
@@ -1115,6 +1115,38 @@ mod tests {
         assert!(buffer.content().iter().any(|cell| cell.symbol() == "◆"));
         assert!(find_run(buffer, "hnx").0 < find_run(buffer, "Jobs").0);
         assert!(find_run(buffer, "rust").0 > find_run(buffer, "Jobs").0);
+    }
+
+    #[test]
+    fn masthead_budgets_wide_search_terms_in_terminal_columns() {
+        let backend = TestBackend::new(65, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut search_page = page();
+        search_page.query = Some("数据库".to_owned());
+        let mut app = App::new(search_page);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wide-character search renders");
+        let buffer = terminal.backend().buffer();
+        let positions = ["数", "据", "库"].map(|symbol| {
+            (0..65)
+                .find(|x| {
+                    buffer
+                        .cell((*x, 0))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                })
+                .expect("wide query glyph is visible")
+        });
+        let masthead = buffer.content()[..65]
+            .iter()
+            .fold(String::new(), |mut output, cell| {
+                output.push_str(cell.symbol());
+                output
+            });
+
+        assert_eq!(positions, [16, 18, 20]);
+        assert!(!masthead.contains("New"));
     }
 
     #[test]
