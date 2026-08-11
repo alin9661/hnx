@@ -95,10 +95,20 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
     let story_rows = layout.stories.map_or(1, |rect| {
         usize::from(rect.height.saturating_sub(1) / 2).max(1)
     });
-    let comment_rows = layout.thread.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(1) / 2).max(1)
+    let mut comment_rows = layout.thread.map_or(1, |rect| {
+        comment_capacity(app, rect, layout.detail.is_some())
     });
+    let comment_offset = app.comment_offset();
     app.set_viewports(story_rows, comment_rows);
+    if app.comment_offset() != comment_offset
+        && let Some(rect) = layout.thread
+    {
+        let adjusted_rows = comment_capacity(app, rect, layout.detail.is_some());
+        if adjusted_rows != comment_rows {
+            comment_rows = adjusted_rows;
+            app.set_viewports(story_rows, comment_rows);
+        }
+    }
     app.set_rendered_panes(layout.panes, layout.mode);
 
     render_tabs(frame, layout.masthead, app, theme);
@@ -198,12 +208,21 @@ fn render_stories(
         return;
     }
     let title = if app.bookmarks_only() {
-        format!(" Saved ({}) ", app.visible_item_count())
+        format!(
+            " Saved · page {} ({}) ",
+            app.page_index().saturating_add(1),
+            app.visible_item_count()
+        )
     } else if app.filter().is_empty() {
-        format!(" Stories ({}) ", app.visible_item_count())
+        format!(
+            " Stories · page {} ({}) ",
+            app.page_index().saturating_add(1),
+            app.visible_item_count()
+        )
     } else {
         format!(
-            " Stories ({}) · /{}/ ",
+            " Stories · page {} ({}) · /{}/ ",
+            app.page_index().saturating_add(1),
             app.visible_item_count(),
             sanitize_single_line(app.filter())
         )
@@ -212,13 +231,18 @@ fn render_stories(
 
     let offset = app.story_offset();
     let selected = app.selected_story_index();
+    let rank_width = app.stories().len().max(1).to_string().len();
     let items: Vec<ListItem<'_>> = app
         .visible_item_window(offset, capacity)
         .enumerate()
         .map(|(relative, item)| {
             story_row(
                 item,
+                app.visible_story_rank(offset.saturating_add(relative))
+                    .unwrap_or_default(),
+                rank_width,
                 app.is_bookmarked(item.id),
+                app.is_read(item.id),
                 selected == Some(offset.saturating_add(relative)),
                 theme,
             )
@@ -257,14 +281,30 @@ fn render_stories(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn story_row(item: &Item, bookmarked: bool, selected: bool, theme: &Theme) -> ListItem<'static> {
-    let marker = if bookmarked { "★ " } else { "  " };
+fn story_row(
+    item: &Item,
+    rank: usize,
+    rank_width: usize,
+    bookmarked: bool,
+    read: bool,
+    selected: bool,
+    theme: &Theme,
+) -> ListItem<'static> {
+    let marker = match (bookmarked, read) {
+        (true, true) => "★✓ ",
+        (true, false) => "★  ",
+        (false, true) => " ✓ ",
+        (false, false) => "   ",
+    };
     let title_style = if item.is_unavailable() {
         theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
+    } else if read && !selected {
+        theme.muted_style().add_modifier(Modifier::BOLD)
     } else {
         primary_style(theme, selected)
     };
     let title = Line::from(vec![
+        Span::styled(format!("{rank:>rank_width$}. "), theme.muted_style()),
         Span::styled(marker, Style::default().fg(theme.warning)),
         Span::styled(sanitize_single_line(item.display_title()), title_style),
     ]);
@@ -328,6 +368,7 @@ fn render_thread(
 
     let offset = app.comment_offset();
     let selected = app.selected_comment_index();
+    let row_width = comment_row_width(area, separator);
     let comments: Vec<ListItem<'_>> = app
         .visible_comment_window(offset, capacity)
         .enumerate()
@@ -336,6 +377,7 @@ fn render_thread(
                 comment,
                 app.is_comment_collapsed(comment.id),
                 selected == Some(offset.saturating_add(relative)),
+                row_width,
                 theme,
             )
         })
@@ -366,6 +408,7 @@ fn comment_row(
     comment: &Comment,
     collapsed: bool,
     selected: bool,
+    row_width: usize,
     theme: &Theme,
 ) -> ListItem<'static> {
     let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
@@ -388,26 +431,108 @@ fn comment_row(
     if !age.is_empty() {
         metadata.push(Span::styled(format!(" · {age}"), theme.muted_style()));
     }
-    let body = comment
+    let body = comment_body(comment);
+    let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
+    let mut lines = vec![Line::from(metadata)];
+    for body_line in wrap_text(&body, body_width.max(1)) {
+        lines.push(Line::from(
+            [
+                depth_rails(depth, theme),
+                vec![
+                    Span::styled("  ", theme.muted_style()),
+                    Span::styled(body_line, primary_style(theme, selected)),
+                ],
+            ]
+            .concat(),
+        ));
+    }
+    ListItem::new(lines)
+}
+
+fn comment_capacity(app: &App, area: Rect, separator: bool) -> usize {
+    let available_rows = usize::from(area.height.saturating_sub(1)).max(1);
+    let row_width = comment_row_width(area, separator);
+    let mut used = 0_usize;
+    let mut count = 0_usize;
+    for comment in app.visible_comment_window(app.comment_offset(), usize::MAX) {
+        let height = comment_height(comment, row_width);
+        if count > 0 && used.saturating_add(height) > available_rows {
+            break;
+        }
+        used = used.saturating_add(height);
+        count = count.saturating_add(1);
+        if used >= available_rows {
+            break;
+        }
+    }
+    count.max(1)
+}
+
+fn comment_row_width(area: Rect, separator: bool) -> usize {
+    usize::from(
+        area.width
+            .saturating_sub(u16::from(separator))
+            .saturating_sub(2),
+    )
+    .max(1)
+}
+
+fn comment_height(comment: &Comment, row_width: usize) -> usize {
+    let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
+    let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
+    1_usize.saturating_add(wrap_text(&comment_body(comment), body_width.max(1)).len())
+}
+
+fn comment_body(comment: &Comment) -> String {
+    comment
         .text
         .as_deref()
         .map(strip_html)
         .map(|body| sanitize_single_line(&body))
         .filter(|body| !body.is_empty())
-        .unwrap_or_else(|| "[deleted]".to_owned());
-    ListItem::new(vec![
-        Line::from(metadata),
-        Line::from(
-            [
-                depth_rails(depth, theme),
-                vec![
-                    Span::styled("  ", theme.muted_style()),
-                    Span::styled(body, primary_style(theme, selected)),
-                ],
-            ]
-            .concat(),
-        ),
-    ])
+        .unwrap_or_else(|| "[deleted]".to_owned())
+}
+
+fn wrap_text(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+
+    for word in input.split_whitespace() {
+        let word_width = Span::raw(word).width();
+        if !line.is_empty() && line_width.saturating_add(1).saturating_add(word_width) <= width {
+            line.push(' ');
+            line.push_str(word);
+            line_width = line_width.saturating_add(1).saturating_add(word_width);
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        if word_width <= width {
+            line.push_str(word);
+            line_width = word_width;
+            continue;
+        }
+        for character in word.chars() {
+            let character_width = Span::raw(character.to_string()).width();
+            if !line.is_empty() && line_width.saturating_add(character_width) > width {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push(character);
+            line_width = line_width.saturating_add(character_width);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn primary_style(theme: &Theme, selected: bool) -> Style {
@@ -575,7 +700,10 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: ResolvedMod
         ));
     }
     if app.loading() {
-        state.push(Span::styled(" loading… ", theme.accent_style()));
+        state.push(Span::styled(
+            format!(" {} loading… ", app.loading_indicator()),
+            theme.accent_style(),
+        ));
     }
     if let Some(error) = app.error() {
         state.push(Span::styled(
@@ -632,7 +760,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("Ctrl+U/D      half-page up/down"),
         Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
-        Line::raw("[/] or 1–6    switch feed"),
+        Line::raw("[/] or 1–6    switch feed · n/p next/previous page"),
         Line::raw(""),
         Line::styled("Layout", theme.accent_style()),
         Line::raw("L             toggle two / three panes"),
@@ -643,21 +771,22 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("/             search Hacker News"),
         Line::raw("f             case-insensitive regex filter"),
         Line::raw("b / Space     toggle bookmark"),
+        Line::raw("m             mark read / unread"),
         Line::raw("B             show only bookmarks"),
         Line::raw(""),
-        Line::raw("a article · o browser · O offline · r refresh · ? close help · q quit"),
+        Line::raw("a article · o browser · O offline · r refresh · ?/q close help"),
     ];
     let compact_help = vec![
         Line::styled("Navigation", theme.accent_style()),
-        Line::raw("j/k move · h/l pane · Tab cycle · Enter open/fold"),
+        Line::raw("j/k move · h/l pane · Tab cycle · n/p pages"),
         Line::styled("Layout", theme.accent_style()),
         Line::raw("L toggle · Alt+h/l resize · Alt+0 reset"),
         Line::styled("Find and save", theme.accent_style()),
-        Line::raw("/ search · f filter · b save · B saved only"),
-        Line::raw("a article · o browser · O offline · r refresh"),
+        Line::raw("/ search · f filter · b save · m read · B saved only"),
+        Line::raw("a article · o browser · O offline · r refresh · q close"),
     ];
     let narrow_help = vec![
-        Line::styled("?/Esc close", theme.accent_style()),
+        Line::styled("?/q/Esc close", theme.accent_style()),
         Line::raw("Nav j/k h/l"),
         Line::raw("Tab cycle"),
         Line::raw("Enter open"),
@@ -665,8 +794,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("Resize Alt-h/l"),
         Line::raw("Find / f"),
         Line::raw("Save b B"),
+        Line::raw("Read m"),
         Line::raw("Read a o"),
-        Line::raw("More O r"),
+        Line::raw("More O r n/p"),
     ];
     let help = if area.width < 40 {
         narrow_help
@@ -679,7 +809,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Paragraph::new(help)
             .block(
                 Block::default()
-                    .title(" Keyboard help · Esc/? close ")
+                    .title(" Keyboard help · Esc/?/q close ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.highlight)),
             )
@@ -1031,6 +1161,94 @@ mod tests {
         assert!(rendered.contains("Cache"));
         assert!(rendered.contains("STALE"));
         assert!(rendered.contains("PARTIAL"));
+    }
+
+    #[test]
+    fn stories_render_absolute_rank_and_persistent_read_marker() {
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut ranked = page();
+        ranked.items.push(Item {
+            id: 2,
+            title: Some("An unread story".to_owned()),
+            ..Item::default()
+        });
+        let mut app = App::new(ranked);
+        app.set_read_items([1]);
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("ranked story renders");
+        let buffer = terminal.backend().buffer();
+        let (rank_x, rank_y) = find_run(buffer, "1.");
+        let (read_x, read_y) = find_run(buffer, "✓");
+        let (title_x, title_y) = find_run(buffer, "A carefully rendered story");
+
+        assert_eq!(rank_y, title_y);
+        assert_eq!(read_y, title_y);
+        assert!(rank_x < read_x && read_x < title_x);
+        assert!(
+            cells_for(buffer, "A carefully rendered story")
+                .all(|cell| cell.fg == Theme::classic().muted)
+        );
+    }
+
+    #[test]
+    fn comment_bodies_wrap_to_the_live_thread_width() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("reader".to_owned()),
+                text: Some(
+                    "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda finalword"
+                        .to_owned(),
+                ),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wrapped comment renders");
+        let buffer = terminal.backend().buffer();
+        let (_, first_y) = find_run(buffer, "alpha");
+        let (_, final_y) = find_run(buffer, "finalword");
+        assert!(final_y > first_y, "comment body did not wrap vertically");
+    }
+
+    #[test]
+    fn loading_status_renders_successive_animation_frames() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.set_loading(true);
+        let first = app.loading_indicator();
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("first loading frame renders");
+        find_run(terminal.backend().buffer(), first);
+
+        assert!(app.advance_loading_animation());
+        let second = app.loading_indicator();
+        assert_ne!(first, second);
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("second loading frame renders");
+        find_run(terminal.backend().buffer(), second);
     }
 
     #[test]
@@ -1493,7 +1711,7 @@ mod tests {
                     output
                 },
             );
-            for expected in ["Esc/? close", "Navigation", "Layout", "Find and save"] {
+            for expected in ["Esc/?/q close", "Navigation", "Layout", "Find and save"] {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} at height {height}"
@@ -1522,7 +1740,7 @@ mod tests {
                     output
                 },
             );
-            for expected in ["?/Esc close", "Nav j/k", "Layout L", "Find / f"] {
+            for expected in ["?/q/Esc close", "Nav j/k", "Layout L", "Find / f"] {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} at width {width}"
