@@ -24,6 +24,7 @@ fn large_thread_app() -> App {
         feed: Feed::Top,
         query: None,
         items: vec![item.clone()],
+        slot_count: 1,
         source: Source::Cache,
         stale: false,
         fetched_at: 1,

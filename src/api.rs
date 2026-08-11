@@ -372,6 +372,7 @@ impl HybridClient {
         }
 
         let response: AlgoliaSearchResponse = self.get_json(url).await?;
+        let slot_count = response.hits.len().min(limit);
         let items = response
             .hits
             .into_iter()
@@ -389,6 +390,7 @@ impl HybridClient {
             feed: Feed::Top,
             query: Some(query.to_owned()),
             items,
+            slot_count,
             source: Source::Algolia,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -404,6 +406,7 @@ impl HybridClient {
         }
 
         let response: AlgoliaSearchResponse = self.get_json(url).await?;
+        let slot_count = response.hits.len().min(limit);
         let items: Vec<_> = response
             .hits
             .into_iter()
@@ -426,6 +429,7 @@ impl HybridClient {
             feed: Feed::Top,
             query: None,
             items,
+            slot_count,
             source: Source::Algolia,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -455,6 +459,7 @@ impl HybridClient {
     }
 
     async fn reconcile_top(&self, algolia_page: StoryPage, ids: Vec<u64>) -> ApiResult<StoryPage> {
+        let slot_count = ids.len();
         let mut algolia_by_id = HashMap::with_capacity(algolia_page.items.len());
         for item in algolia_page.items {
             algolia_by_id.entry(item.id).or_insert(item);
@@ -495,6 +500,7 @@ impl HybridClient {
             feed: Feed::Top,
             query: None,
             items,
+            slot_count,
             source: Source::Hybrid,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -519,6 +525,7 @@ impl HybridClient {
         ids: Vec<u64>,
         limit: usize,
     ) -> ApiResult<StoryPage> {
+        let slot_count = ids.len();
         let ranks: HashMap<_, _> = ids
             .iter()
             .enumerate()
@@ -538,6 +545,7 @@ impl HybridClient {
             feed,
             query: None,
             items,
+            slot_count,
             source: Source::Firebase,
             stale: false,
             fetched_at: unix_timestamp(),
@@ -951,6 +959,7 @@ fn empty_page(feed: Feed, source: Source) -> StoryPage {
         feed,
         query: None,
         items: Vec::new(),
+        slot_count: 0,
         source,
         stale: false,
         fetched_at: unix_timestamp(),

@@ -262,6 +262,10 @@ pub struct StoryPage {
     pub query: Option<String>,
     #[serde(default)]
     pub items: Vec<Item>,
+    /// Number of upstream ranked slots fetched for this prefix. It can exceed
+    /// `items.len()` when one or more records were unreadable.
+    #[serde(default)]
+    pub slot_count: usize,
     pub source: Source,
     #[serde(default)]
     pub stale: bool,
@@ -284,11 +288,13 @@ impl StoryPage {
     /// larger than `items.len()` when an upstream record could not be decoded.
     #[must_use]
     pub fn covered_slots(&self) -> usize {
-        self.items
-            .iter()
-            .filter_map(|item| item.rank)
-            .max()
-            .unwrap_or(self.items.len())
+        self.slot_count.max(
+            self.items
+                .iter()
+                .filter_map(|item| item.rank)
+                .max()
+                .unwrap_or(self.items.len()),
+        )
     }
 }
 

@@ -1,6 +1,9 @@
 //! Event-driven application state for the terminal interface.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use regex::RegexBuilder;
@@ -11,6 +14,8 @@ use crate::{
 };
 
 pub use crate::layout::{FocusPane, SecondaryPane};
+
+const QUIT_REPEAT_GUARD: Duration = Duration::from_millis(750);
 
 /// The active text prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +198,7 @@ pub struct App {
     page_source: Option<Source>,
     page_stale: bool,
     page_fetched_at: Option<i64>,
+    page_slots: usize,
     page_index: usize,
     page_size: usize,
     source: Option<Source>,
@@ -222,6 +228,7 @@ pub struct App {
     bookmarks_only: bool,
     prompt: Option<Prompt>,
     help_visible: bool,
+    quit_guard_until: Option<Instant>,
 }
 
 impl App {
@@ -249,6 +256,7 @@ impl App {
             page_source: None,
             page_stale: false,
             page_fetched_at: None,
+            page_slots: 0,
             page_index: 0,
             page_size: 30,
             source: None,
@@ -278,6 +286,7 @@ impl App {
             bookmarks_only: false,
             prompt: None,
             help_visible: false,
+            quit_guard_until: None,
         }
     }
 
@@ -440,11 +449,7 @@ impl App {
     /// Upstream slots covered by the currently loaded ranked prefix.
     #[must_use]
     pub fn loaded_story_slots(&self) -> usize {
-        self.stories
-            .iter()
-            .filter_map(|item| item.rank)
-            .max()
-            .unwrap_or(self.stories.len())
+        self.page_slots
     }
 
     /// Iterates over stories after applying the local filter and bookmarks-only view.
@@ -592,6 +597,7 @@ impl App {
         }
         self.page_index = page_index;
         self.page_size = page_size;
+        self.page_slots = page.covered_slots();
         self.feed = page.feed;
         self.search_query = page.query;
         self.stories = page.items;
@@ -637,8 +643,10 @@ impl App {
         }
 
         let selected_id = self.selected_item().map(|item| item.id);
+        let page_slots = page.covered_slots();
         self.feed = page.feed;
         self.search_query = page.query;
+        self.page_slots = page_slots;
         self.stories = page.items;
         self.page_source = Some(page.source);
         self.page_stale = page.stale;
@@ -843,6 +851,9 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.kind == KeyEventKind::Release {
+            if key.code == KeyCode::Char('q') {
+                self.quit_guard_until = None;
+            }
             return AppAction::None;
         }
 
@@ -850,6 +861,18 @@ impl App {
             && matches!(key.code, KeyCode::Char('c' | 'q'))
         {
             return AppAction::Quit;
+        }
+
+        let plain_q = key.code == KeyCode::Char('q') && key.modifiers.is_empty();
+        if plain_q {
+            let now = Instant::now();
+            if self.quit_guard_until.is_some_and(|until| now < until) {
+                self.quit_guard_until = Some(now + QUIT_REPEAT_GUARD);
+                return AppAction::None;
+            }
+            self.quit_guard_until = None;
+        } else {
+            self.quit_guard_until = None;
         }
 
         // Repeated q events may outlive the help modal they dismissed. Ignore
@@ -865,6 +888,9 @@ impl App {
         if self.help_visible {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
                 self.help_visible = false;
+                if plain_q {
+                    self.quit_guard_until = Some(Instant::now() + QUIT_REPEAT_GUARD);
+                }
             }
             return AppAction::None;
         }
@@ -1358,6 +1384,7 @@ impl App {
         self.page_source = None;
         self.page_stale = false;
         self.page_fetched_at = None;
+        self.page_slots = 0;
         self.clear_story_context();
         self.set_focus(FocusPane::Stories);
         self.set_loading(true);
@@ -1515,6 +1542,7 @@ mod tests {
                     ..Item::default()
                 })
                 .collect(),
+            slot_count: 8,
             source: Source::Algolia,
             stale: false,
             fetched_at: 42,
@@ -1677,6 +1705,17 @@ mod tests {
                 KeyCode::Char('q'),
                 KeyModifiers::NONE,
                 KeyEventKind::Repeat,
+            )),
+            AppAction::None
+        );
+        // Terminals without enhanced key reporting send autorepeat as another
+        // Press; the rolling guard covers that fallback too.
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
             )),
             AppAction::None
         );

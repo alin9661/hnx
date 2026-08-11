@@ -726,7 +726,16 @@ fn warn_stderr(message: std::fmt::Arguments<'_>) {
 
 fn cache_page(mut entry: CacheEntry<StoryPage>, limit: Option<usize>) -> StoryPage {
     if let Some(limit) = limit {
-        entry.value.items.truncate(limit);
+        if entry.value.items.iter().any(|item| item.rank.is_some()) {
+            entry
+                .value
+                .items
+                .retain(|item| item.rank.is_some_and(|rank| rank <= limit));
+            entry.value.slot_count = entry.value.slot_count.min(limit);
+        } else {
+            entry.value.items.truncate(limit);
+            entry.value.slot_count = entry.value.items.len();
+        }
     }
     entry.value.source = Source::Cache;
     entry.value.stale = entry.metadata.stale;
@@ -956,6 +965,8 @@ fn cleanup_once(active: &AtomicBool, cleanup: impl FnOnce()) {
 
 fn restore_terminal_best_effort() {
     let mut output = stdout();
+    #[cfg(unix)]
+    let _ = execute!(output, crossterm::event::PopKeyboardEnhancementFlags);
     let _ = execute!(output, DisableMouseCapture);
     let _ = execute!(output, LeaveAlternateScreen);
     let _ = execute!(output, Show);
@@ -975,6 +986,13 @@ impl TerminalSession {
         enable_raw_mode()?;
         let mut output = stdout();
         execute!(output, EnterAlternateScreen)?;
+        #[cfg(unix)]
+        execute!(
+            output,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        )?;
         execute!(output, EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(output))?;
 
@@ -1383,7 +1401,9 @@ async fn run_tui(
                                     }
                                 }
                                 AppAction::LoadArticle(item_id) => {
+                                    thread_request_id = next_request_id(thread_request_id);
                                     article_request_id = next_request_id(article_request_id);
+                                    abort_task(&mut thread_task);
                                     abort_task(&mut article_task);
                                     if app.offline() {
                                         app.set_error("Article fetching is unavailable in offline mode");
@@ -1796,13 +1816,14 @@ mod tests {
         io::{self, ErrorKind, Write},
         mem::ManuallyDrop,
         sync::atomic::AtomicBool,
+        time::Duration,
     };
 
     use clap::Parser as _;
 
     use super::{
         CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
-        apply_requested_layout, cleanup_once, combine_warnings, config_input_error,
+        apply_requested_layout, cache_page, cleanup_once, combine_warnings, config_input_error,
         handle_open_story, next_request_id, page_limit, parse_item_id, parse_limit,
         parse_search_query, persist_layout_action, refresh_limit, should_cancel_pending_next,
         write_buffered, write_comments, write_item, write_json, write_page, write_thread,
@@ -2026,6 +2047,7 @@ mod tests {
                     ..Item::default()
                 })
                 .collect(),
+            slot_count: 60,
             source: Source::Cache,
             stale: false,
             fetched_at: 1,
@@ -2035,7 +2057,46 @@ mod tests {
 
         page.items.truncate(30);
         app.refresh_page(page);
-        assert_eq!(refresh_limit(&app), 30);
+        assert_eq!(refresh_limit(&app), 60);
+    }
+
+    #[test]
+    fn cached_limits_follow_canonical_rank_slots() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let mut page = StoryPage {
+            feed: Feed::Top,
+            query: None,
+            items: (1..=60)
+                .filter(|rank| *rank != 30)
+                .map(|rank| Item {
+                    id: rank,
+                    rank: Some(usize::try_from(rank).expect("rank fits")),
+                    ..Item::default()
+                })
+                .collect(),
+            slot_count: 60,
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 1,
+        };
+        cache
+            .put_feed(&page, Duration::from_secs(60))
+            .expect("ranked page stores");
+        page = cache_page(
+            cache
+                .get_feed(Feed::Top)
+                .expect("ranked page reads")
+                .expect("ranked page exists"),
+            Some(30),
+        );
+
+        assert_eq!(page.slot_count, 30);
+        assert_eq!(page.items.len(), 29);
+        assert!(
+            page.items
+                .iter()
+                .all(|item| item.rank.is_some_and(|rank| rank <= 30))
+        );
     }
 
     #[test]
@@ -2059,6 +2120,7 @@ mod tests {
             feed: Feed::Top,
             query: None,
             items: Vec::new(),
+            slot_count: 0,
             source: Source::Cache,
             stale: false,
             fetched_at: 1,
@@ -2086,6 +2148,7 @@ mod tests {
                 url: Some("https://example.com".to_owned()),
                 ..Item::default()
             }],
+            slot_count: 1,
             source: Source::Cache,
             stale: false,
             fetched_at: 1,
@@ -2199,6 +2262,7 @@ mod tests {
             feed: Feed::Top,
             query: None,
             items: vec![item.clone()],
+            slot_count: 1,
             source: Source::Cache,
             stale: true,
             fetched_at: 123,
