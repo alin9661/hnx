@@ -409,8 +409,7 @@ impl App {
 
     /// Switches to an already-loaded page in the cached ranked prefix.
     pub fn show_page(&mut self, page_index: usize) -> bool {
-        let start = page_index.saturating_mul(self.page_size);
-        if start >= self.stories.len() {
+        if !self.page_has_stories(page_index) {
             return false;
         }
         self.page_index = page_index;
@@ -438,6 +437,16 @@ impl App {
         &self.stories
     }
 
+    /// Upstream slots covered by the currently loaded ranked prefix.
+    #[must_use]
+    pub fn loaded_story_slots(&self) -> usize {
+        self.stories
+            .iter()
+            .filter_map(|item| item.rank)
+            .max()
+            .unwrap_or(self.stories.len())
+    }
+
     /// Iterates over stories after applying the local filter and bookmarks-only view.
     pub fn visible_items(&self) -> impl Iterator<Item = &Item> {
         self.visible_story_indices
@@ -462,7 +471,11 @@ impl App {
     pub fn visible_story_rank(&self, visible_index: usize) -> Option<usize> {
         self.visible_story_indices
             .get(visible_index)
-            .map(|index| index.saturating_add(1))
+            .and_then(|index| {
+                self.stories
+                    .get(*index)
+                    .map(|item| item.rank.unwrap_or_else(|| index.saturating_add(1)))
+            })
     }
 
     #[must_use]
@@ -573,7 +586,7 @@ impl App {
     /// Replaces the story data and displays one page from its ranked prefix.
     pub fn set_page_at(&mut self, page: StoryPage, page_index: usize, page_size: usize) {
         let page_size = page_size.max(1);
-        if page_index > 0 && page_index.saturating_mul(page_size) >= page.items.len() {
+        if page_index > 0 && !page_contains_page(&page.items, page_index, page_size) {
             self.set_error("No more stories are available");
             return;
         }
@@ -713,6 +726,15 @@ impl App {
         self.read_items = items.into_iter().collect();
     }
 
+    /// Updates local read state after its user-visible operation has succeeded.
+    pub fn set_read(&mut self, item_id: u64, read: bool) {
+        if read {
+            self.read_items.insert(item_id);
+        } else {
+            self.read_items.remove(&item_id);
+        }
+    }
+
     pub fn set_bookmarked(&mut self, item_id: u64, bookmarked: bool) {
         if bookmarked {
             self.bookmarks.insert(item_id);
@@ -735,8 +757,9 @@ impl App {
     }
 
     pub fn set_loading(&mut self, loading: bool) {
+        let started = loading && !self.loading;
         self.loading = loading;
-        if loading {
+        if started {
             self.loading_frame = 0;
             self.error = None;
         }
@@ -827,6 +850,12 @@ impl App {
             && matches!(key.code, KeyCode::Char('c' | 'q'))
         {
             return AppAction::Quit;
+        }
+
+        // Repeated q events may outlive the help modal they dismissed. Ignore
+        // repeats so a held dismissal key cannot become a global quit command.
+        if key.kind == KeyEventKind::Repeat && key.code == KeyCode::Char('q') {
+            return AppAction::None;
         }
 
         if self.prompt.is_some() {
@@ -1255,7 +1284,6 @@ impl App {
                 let Some(item_id) = self.selected_item().map(|item| item.id) else {
                     return AppAction::None;
                 };
-                self.read_items.insert(item_id);
                 self.set_loading(true);
                 self.set_focus(FocusPane::Thread);
                 AppAction::LoadThread(item_id)
@@ -1272,7 +1300,6 @@ impl App {
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return AppAction::None;
         };
-        self.read_items.insert(item_id);
         AppAction::OpenStory(item_id)
     }
 
@@ -1280,7 +1307,6 @@ impl App {
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return AppAction::None;
         };
-        self.read_items.insert(item_id);
         self.set_loading(true);
         self.set_focus(FocusPane::Detail);
         AppAction::LoadArticle(item_id)
@@ -1396,22 +1422,47 @@ impl App {
 
     fn rebuild_visible_stories(&mut self) {
         let start = self.page_index.saturating_mul(self.page_size);
-        let end = start.saturating_add(self.page_size).min(self.stories.len());
+        let end = start.saturating_add(self.page_size);
         let indices = self
             .stories
             .iter()
             .enumerate()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .filter_map(|(index, item)| self.story_is_visible(item).then_some(index))
+            .filter_map(|(index, item)| {
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                (rank > start && rank <= end && self.story_is_visible(item)).then_some(index)
+            })
             .collect();
         self.visible_story_indices = indices;
     }
 
     fn visible_page_len(&self) -> usize {
-        let start = self.page_index.saturating_mul(self.page_size);
-        self.stories.len().saturating_sub(start).min(self.page_size)
+        self.stories_on_page(self.page_index).count()
     }
+
+    fn page_has_stories(&self, page_index: usize) -> bool {
+        self.stories_on_page(page_index).next().is_some()
+    }
+
+    fn stories_on_page(&self, page_index: usize) -> impl Iterator<Item = &Item> {
+        let start = page_index.saturating_mul(self.page_size);
+        let end = start.saturating_add(self.page_size);
+        self.stories
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, item)| {
+                let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+                (rank > start && rank <= end).then_some(item)
+            })
+    }
+}
+
+fn page_contains_page(items: &[Item], page_index: usize, page_size: usize) -> bool {
+    let start = page_index.saturating_mul(page_size);
+    let end = start.saturating_add(page_size);
+    items.iter().enumerate().any(|(index, item)| {
+        let rank = item.rank.unwrap_or_else(|| index.saturating_add(1));
+        rank > start && rank <= end
+    })
 }
 
 fn flatten_comments(comments: &[Comment]) -> Vec<Comment> {
@@ -1446,7 +1497,7 @@ fn flatten_comments(comments: &[Comment]) -> Vec<Comment> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::{App, AppAction, FocusPane};
     use crate::model::{Comment, Feed, Item, Source, StoryPage, Thread};
@@ -1621,6 +1672,14 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::None);
         assert!(!app.help_visible());
+        assert_eq!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            AppAction::None
+        );
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::Quit);
     }
 
@@ -1671,7 +1730,27 @@ mod tests {
     }
 
     #[test]
-    fn stories_can_be_marked_read_unread_and_opening_marks_read() {
+    fn pagination_uses_upstream_slots_when_a_story_is_unreadable() {
+        let mut ranked = page();
+        ranked.items = (1..=60)
+            .filter(|rank| *rank != 30)
+            .map(|rank| Item {
+                id: u64::try_from(rank).expect("rank fits"),
+                rank: Some(rank),
+                title: Some(format!("Story {rank}")),
+                ..Item::default()
+            })
+            .collect();
+        let mut app = App::new(ranked.clone());
+
+        assert_eq!(app.visible_item_count(), 29);
+        app.set_page_at(ranked, 1, 30);
+        assert_eq!(app.visible_story_rank(0), Some(31));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(31));
+    }
+
+    #[test]
+    fn stories_can_be_marked_read_and_implicit_reads_wait_for_success() {
         let mut app = App::new(page());
         assert_eq!(
             app.handle_key(key(KeyCode::Char('m'))),
@@ -1694,6 +1773,8 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             AppAction::LoadThread(1)
         );
+        assert!(!app.is_read(1));
+        app.set_read(1, true);
         assert!(app.is_read(1));
     }
 
