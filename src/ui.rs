@@ -7,7 +7,9 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -18,6 +20,10 @@ use crate::{
     sanitize::{sanitize_single_line, sanitize_text},
     theme::Theme,
 };
+
+const STORY_HIGHLIGHT: &str = " ▸";
+const STORY_HIGHLIGHT_WIDTH: u16 = 2;
+const STORY_MARKER_WIDTH: usize = 2;
 
 /// Rectangles used by the renderer. `None` means that pane is hidden at this width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,22 +99,31 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, theme: &Theme) {
         app.focus(),
         app.secondary_pane(),
     );
-    let story_rows = layout.stories.map_or(1, |rect| {
-        usize::from(rect.height.saturating_sub(1) / 2).max(1)
+    let mut story_rows = layout.stories.map_or(1, |rect| {
+        story_capacity(
+            app,
+            rect,
+            layout.thread.is_some() || layout.detail.is_some(),
+        )
     });
     let mut comment_rows = layout.thread.map_or(1, |rect| {
         comment_capacity(app, rect, layout.detail.is_some())
     });
+    let story_offset = app.story_offset();
     let comment_offset = app.comment_offset();
     app.set_viewports(story_rows, comment_rows);
-    if app.comment_offset() != comment_offset
-        && let Some(rect) = layout.thread
-    {
-        let adjusted_rows = comment_capacity(app, rect, layout.detail.is_some());
-        if adjusted_rows != comment_rows {
-            comment_rows = adjusted_rows;
-            app.set_viewports(story_rows, comment_rows);
+    if app.story_offset() != story_offset || app.comment_offset() != comment_offset {
+        if let Some(rect) = layout.stories {
+            story_rows = story_capacity(
+                app,
+                rect,
+                layout.thread.is_some() || layout.detail.is_some(),
+            );
         }
+        if let Some(rect) = layout.thread {
+            comment_rows = comment_capacity(app, rect, layout.detail.is_some());
+        }
+        app.set_viewports(story_rows, comment_rows);
     }
     app.set_rendered_panes(layout.panes, layout.mode);
 
@@ -232,19 +247,34 @@ fn render_stories(
 
     let offset = app.story_offset();
     let selected = app.selected_story_index();
-    let rank_width = app.stories().len().max(1).to_string().len();
+    let rank_width = app
+        .loaded_story_slots()
+        .max(app.stories().len())
+        .max(1)
+        .to_string()
+        .len();
+    let row_width = story_row_width(area, separator);
+    let mut remaining_rows = usize::from(area.height.saturating_sub(1)).max(1);
     let items: Vec<ListItem<'_>> = app
         .visible_item_window(offset, capacity)
         .enumerate()
         .map(|(relative, item)| {
+            let rank = app
+                .visible_story_rank(offset.saturating_add(relative))
+                .unwrap_or_default();
+            let height = story_height(item, rank, rank_width, row_width, remaining_rows).max(1);
+            remaining_rows = remaining_rows.saturating_sub(height);
             story_row(
                 item,
-                app.visible_story_rank(offset.saturating_add(relative))
-                    .unwrap_or_default(),
-                rank_width,
-                app.is_bookmarked(item.id),
-                app.is_read(item.id),
-                selected == Some(offset.saturating_add(relative)),
+                StoryRowContext {
+                    rank,
+                    rank_width,
+                    bookmarked: app.is_bookmarked(item.id),
+                    read: app.is_read(item.id),
+                    selected: selected == Some(offset.saturating_add(relative)),
+                    row_width,
+                    max_height: height,
+                },
                 theme,
             )
         })
@@ -277,26 +307,38 @@ fn render_stories(
     let highlight_style = Style::default().bg(theme.selected_bg);
     let list = List::new(items)
         .block(block)
-        .highlight_symbol("▸ ")
+        .highlight_symbol(STORY_HIGHLIGHT)
+        .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(highlight_style);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn story_row(
-    item: &Item,
+#[derive(Clone, Copy)]
+struct StoryRowContext {
     rank: usize,
     rank_width: usize,
     bookmarked: bool,
     read: bool,
     selected: bool,
-    theme: &Theme,
-) -> ListItem<'static> {
-    const MARKER_WIDTH: usize = 3;
+    row_width: usize,
+    max_height: usize,
+}
+
+fn story_row(item: &Item, context: StoryRowContext, theme: &Theme) -> ListItem<'static> {
+    let StoryRowContext {
+        rank,
+        rank_width,
+        bookmarked,
+        read,
+        selected,
+        row_width,
+        max_height,
+    } = context;
     let marker = match (bookmarked, read) {
-        (true, true) => "★✓ ",
-        (true, false) => "★  ",
-        (false, true) => " ✓ ",
-        (false, false) => "   ",
+        (true, true) => "★✓",
+        (true, false) => "★ ",
+        (false, true) => "✓ ",
+        (false, false) => "  ",
     };
     let title_style = if item.is_unavailable() {
         theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
@@ -306,12 +348,31 @@ fn story_row(
         primary_style(theme, selected)
     };
     let rank_prefix = format!("{rank:>rank_width$}. ");
-    let title_indent = " ".repeat(MARKER_WIDTH.saturating_add(rank_prefix.len()));
-    let title = Line::from(vec![
-        Span::styled(marker, Style::default().fg(theme.warning)),
-        Span::styled(rank_prefix, theme.muted_style()),
-        Span::styled(sanitize_single_line(item.display_title()), title_style),
-    ]);
+    let title_indent = " ".repeat(STORY_MARKER_WIDTH.saturating_add(rank_prefix.len()));
+    let title_width = row_width.saturating_sub(title_indent.len()).max(1);
+    let title_limit = max_height.saturating_sub(1).max(1);
+    let (mut title_lines, truncated) = wrap_text_limited(
+        &sanitize_single_line(item.display_title()),
+        title_width,
+        title_limit,
+    );
+    if truncated && let Some(last) = title_lines.last_mut() {
+        "…".clone_into(last);
+    }
+    let mut lines = Vec::with_capacity(title_lines.len().saturating_add(1));
+    if let Some(first) = title_lines.first() {
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme.warning)),
+            Span::styled(rank_prefix, theme.muted_style()),
+            Span::styled(first.clone(), title_style),
+        ]));
+    }
+    lines.extend(title_lines.into_iter().skip(1).map(|title| {
+        Line::from(vec![
+            Span::raw(title_indent.clone()),
+            Span::styled(title, title_style),
+        ])
+    }));
 
     let author = sanitize_single_line(item.by.as_deref().unwrap_or("unknown"));
     let domain = sanitize_single_line(
@@ -321,21 +382,109 @@ fn story_row(
             .unwrap_or("news.ycombinator.com"),
     );
     let age = age(item.time);
-    let mut metadata = vec![Span::styled(
-        format!(
-            "{title_indent}{} pts · {} comments · ",
-            item.score, item.descendants
-        ),
-        theme.muted_style(),
-    )];
-    metadata.push(Span::styled(author, primary_style(theme, selected)));
-    let suffix = if age.is_empty() {
-        format!(" · {domain}")
-    } else {
-        format!(" · {age} · {domain}")
-    };
-    metadata.push(Span::styled(suffix, theme.muted_style()));
-    ListItem::new(vec![title, Line::from(metadata)])
+    if max_height > 1 {
+        let mut metadata = vec![Span::styled(
+            format!(
+                "{title_indent}{} pts · {} comments · ",
+                item.score, item.descendants
+            ),
+            theme.muted_style(),
+        )];
+        metadata.push(Span::styled(author, primary_style(theme, selected)));
+        let suffix = if age.is_empty() {
+            format!(" · {domain}")
+        } else {
+            format!(" · {age} · {domain}")
+        };
+        metadata.push(Span::styled(suffix, theme.muted_style()));
+        lines.push(Line::from(metadata));
+    }
+    ListItem::new(lines)
+}
+
+fn story_capacity(app: &App, area: Rect, separator: bool) -> usize {
+    let available_rows = usize::from(area.height.saturating_sub(1)).max(1);
+    let row_width = story_row_width(area, separator);
+    let rank_width = app
+        .loaded_story_slots()
+        .max(app.stories().len())
+        .max(1)
+        .to_string()
+        .len();
+    let len = app.visible_item_count();
+    if len == 0 {
+        return 1;
+    }
+    let mut start = app.story_offset().min(len.saturating_sub(1));
+    let mut count = story_window_capacity(app, start, available_rows, row_width, rank_width);
+    while start > 0 && count == len.saturating_sub(start) {
+        let candidate = start.saturating_sub(1);
+        let candidate_count =
+            story_window_capacity(app, candidate, available_rows, row_width, rank_width);
+        if candidate_count != len.saturating_sub(candidate) {
+            break;
+        }
+        start = candidate;
+        count = candidate_count;
+    }
+    count.max(1)
+}
+
+fn story_window_capacity(
+    app: &App,
+    offset: usize,
+    available_rows: usize,
+    row_width: usize,
+    rank_width: usize,
+) -> usize {
+    let mut used = 0_usize;
+    let mut count = 0_usize;
+    for (relative, item) in app.visible_item_window(offset, usize::MAX).enumerate() {
+        let remaining = available_rows.saturating_sub(used);
+        let rank = app
+            .visible_story_rank(offset.saturating_add(relative))
+            .unwrap_or_default();
+        let height = story_height(item, rank, rank_width, row_width, remaining);
+        if count > 0 && used.saturating_add(height) > available_rows {
+            break;
+        }
+        used = used.saturating_add(height);
+        count = count.saturating_add(1);
+        if used >= available_rows {
+            break;
+        }
+    }
+    count
+}
+
+fn story_row_width(area: Rect, separator: bool) -> usize {
+    usize::from(
+        area.width
+            .saturating_sub(u16::from(separator))
+            .saturating_sub(STORY_HIGHLIGHT_WIDTH),
+    )
+    .max(1)
+}
+
+fn story_height(
+    item: &Item,
+    rank: usize,
+    rank_width: usize,
+    row_width: usize,
+    max_height: usize,
+) -> usize {
+    let prefix_width = STORY_MARKER_WIDTH.saturating_add(format!("{rank:>rank_width$}. ").len());
+    let title_width = row_width.saturating_sub(prefix_width).max(1);
+    let title_limit = max_height.saturating_sub(1).max(1);
+    let (title_lines, _) = wrap_text_limited(
+        &sanitize_single_line(item.display_title()),
+        title_width,
+        title_limit,
+    );
+    title_lines
+        .len()
+        .saturating_add(usize::from(max_height > 1))
+        .min(max_height.max(1))
 }
 
 fn render_thread(
@@ -1096,7 +1245,33 @@ mod tests {
                 }
             }
         }
-        panic!("rendered text `{needle}` was not found");
+        panic!(
+            "rendered text `{needle}` was not found in:\n{}",
+            buffer
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                })
+        );
+    }
+
+    fn find_run_on_row(buffer: &ratatui::buffer::Buffer, needle: &str, y: u16) -> u16 {
+        let symbols: Vec<_> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        (buffer.area.x..buffer.area.right())
+            .find(|x| {
+                symbols.iter().enumerate().all(|(offset, symbol)| {
+                    u16::try_from(offset)
+                        .ok()
+                        .and_then(|offset| buffer.cell((x.saturating_add(offset), y)))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                })
+            })
+            .unwrap_or_else(|| panic!("rendered text `{needle}` was not found on row {y}"))
     }
 
     fn cells_for<'a>(
@@ -1233,7 +1408,7 @@ mod tests {
             ..Item::default()
         });
         let mut app = App::new(ranked);
-        app.set_read_items([1]);
+        app.set_read_items([1, 2]);
         let _ = app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Down,
             crossterm::event::KeyModifiers::NONE,
@@ -1258,6 +1433,44 @@ mod tests {
         assert!(
             cells_for(buffer, "A carefully rendered story")
                 .all(|cell| cell.fg == Theme::classic().muted)
+        );
+
+        let (selected_title_x, selected_y) = find_run(buffer, "An unread story");
+        let arrow_x = find_run_on_row(buffer, "▸", selected_y);
+        let selected_read_x = find_run_on_row(buffer, "✓", selected_y);
+        let selected_rank_x = find_run_on_row(buffer, "2.", selected_y);
+        assert_eq!(selected_read_x, arrow_x.saturating_add(1));
+        assert_eq!(selected_rank_x, selected_read_x.saturating_add(2));
+        assert_eq!(
+            selected_title_x,
+            selected_rank_x.saturating_add(rank_label_width)
+        );
+    }
+
+    #[test]
+    fn story_titles_wrap_to_the_live_panel_width() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut ranked = page();
+        ranked.items[0].title = Some(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda finalword".to_owned(),
+        );
+        let mut app = App::new(ranked);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("wrapped story renders");
+        let buffer = terminal.backend().buffer();
+        let (first_x, first_y) = find_run(buffer, "alpha");
+        let (final_x, final_y) = find_run(buffer, "finalword");
+        let (points_x, points_y) = find_run(buffer, "123 pts");
+
+        assert!(final_x >= first_x);
+        assert!(final_y > first_y, "story title did not wrap vertically");
+        assert_eq!(points_x, first_x);
+        assert!(
+            points_y > final_y,
+            "metadata did not follow the wrapped title"
         );
     }
 
