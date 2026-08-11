@@ -66,12 +66,18 @@ pub enum AppAction {
     LoadThread(u64),
     Search(String),
     Refresh,
+    NextPage,
+    PreviousPage,
     OpenStory(u64),
     LoadArticle(u64),
     SetOffline(bool),
     BookmarkChanged {
         item_id: u64,
         bookmarked: bool,
+    },
+    ReadChanged {
+        item_id: u64,
+        read: bool,
     },
     LayoutChanged(LayoutPreferences),
     LayoutReset,
@@ -187,11 +193,14 @@ pub struct App {
     page_source: Option<Source>,
     page_stale: bool,
     page_fetched_at: Option<i64>,
+    page_index: usize,
+    page_size: usize,
     source: Option<Source>,
     stale: bool,
     fetched_at: Option<i64>,
     offline: bool,
     loading: bool,
+    loading_frame: u8,
     status: Option<String>,
     error: Option<String>,
     focus: FocusPane,
@@ -209,6 +218,7 @@ pub struct App {
     filter_regex: Option<regex::Regex>,
     search_query: Option<String>,
     bookmarks: BTreeSet<u64>,
+    read_items: BTreeSet<u64>,
     bookmarks_only: bool,
     prompt: Option<Prompt>,
     help_visible: bool,
@@ -239,11 +249,14 @@ impl App {
             page_source: None,
             page_stale: false,
             page_fetched_at: None,
+            page_index: 0,
+            page_size: 30,
             source: None,
             stale: false,
             fetched_at: None,
             offline: false,
             loading: false,
+            loading_frame: 0,
             status: None,
             error: None,
             focus: FocusPane::Stories,
@@ -261,6 +274,7 @@ impl App {
             filter_regex: None,
             search_query: None,
             bookmarks: BTreeSet::new(),
+            read_items: BTreeSet::new(),
             bookmarks_only: false,
             prompt: None,
             help_visible: false,
@@ -295,6 +309,21 @@ impl App {
     #[must_use]
     pub const fn loading(&self) -> bool {
         self.loading
+    }
+
+    #[must_use]
+    pub const fn loading_indicator(&self) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        FRAMES[self.loading_frame as usize % FRAMES.len()]
+    }
+
+    /// Advances the loading indicator when an asynchronous operation is active.
+    pub fn advance_loading_animation(&mut self) -> bool {
+        if !self.loading {
+            return false;
+        }
+        self.loading_frame = self.loading_frame.wrapping_add(1);
+        true
     }
 
     /// Whether the loaded comment tree is known to omit comments.
@@ -364,6 +393,42 @@ impl App {
     }
 
     #[must_use]
+    pub fn read_items(&self) -> &BTreeSet<u64> {
+        &self.read_items
+    }
+
+    #[must_use]
+    pub fn is_read(&self, item_id: u64) -> bool {
+        self.read_items.contains(&item_id)
+    }
+
+    #[must_use]
+    pub const fn page_index(&self) -> usize {
+        self.page_index
+    }
+
+    /// Switches to an already-loaded page in the cached ranked prefix.
+    pub fn show_page(&mut self, page_index: usize) -> bool {
+        let start = page_index.saturating_mul(self.page_size);
+        if start >= self.stories.len() {
+            return false;
+        }
+        self.page_index = page_index;
+        self.rebuild_visible_stories();
+        self.reset_story_selection();
+        self.clear_story_context();
+        self.set_focus(FocusPane::Stories);
+        self.loading = false;
+        self.error = None;
+        self.status = Some(format!(
+            "Page {} · {} stories",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
+        true
+    }
+
+    #[must_use]
     pub fn is_bookmarked(&self, item_id: u64) -> bool {
         self.bookmarks.contains(&item_id)
     }
@@ -390,6 +455,14 @@ impl App {
             .unwrap_or_default()
             .iter()
             .filter_map(|index| self.stories.get(*index))
+    }
+
+    /// Returns the absolute feed rank for an item in the filtered visible view.
+    #[must_use]
+    pub fn visible_story_rank(&self, visible_index: usize) -> Option<usize> {
+        self.visible_story_indices
+            .get(visible_index)
+            .map(|index| index.saturating_add(1))
     }
 
     #[must_use]
@@ -494,6 +567,18 @@ impl App {
     /// Replaces the story page while retaining local preferences such as bookmarks and offline
     /// mode.
     pub fn set_page(&mut self, page: StoryPage) {
+        self.set_page_at(page, 0, 30);
+    }
+
+    /// Replaces the story data and displays one page from its ranked prefix.
+    pub fn set_page_at(&mut self, page: StoryPage, page_index: usize, page_size: usize) {
+        let page_size = page_size.max(1);
+        if page_index > 0 && page_index.saturating_mul(page_size) >= page.items.len() {
+            self.set_error("No more stories are available");
+            return;
+        }
+        self.page_index = page_index;
+        self.page_size = page_size;
         self.feed = page.feed;
         self.search_query = page.query;
         self.stories = page.items;
@@ -510,7 +595,11 @@ impl App {
         self.detail_scroll = 0;
         self.loading = false;
         self.error = None;
-        self.status = Some(format!("{} stories loaded", self.stories.len()));
+        self.status = Some(format!(
+            "Page {} · {} stories",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
         self.rebuild_visible_stories();
         self.reset_story_selection();
         self.comment_selection.reset(0);
@@ -561,7 +650,11 @@ impl App {
             self.clear_story_context();
             self.set_focus(FocusPane::Stories);
         }
-        self.status = Some(format!("{} stories refreshed", self.stories.len()));
+        self.status = Some(format!(
+            "Page {} · {} stories refreshed",
+            self.page_index.saturating_add(1),
+            self.visible_page_len()
+        ));
     }
 
     pub fn load_thread(&mut self, thread: Thread) {
@@ -613,6 +706,13 @@ impl App {
         self.reset_story_selection_after_view_change();
     }
 
+    pub fn set_read_items<I>(&mut self, items: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.read_items = items.into_iter().collect();
+    }
+
     pub fn set_bookmarked(&mut self, item_id: u64, bookmarked: bool) {
         if bookmarked {
             self.bookmarks.insert(item_id);
@@ -637,6 +737,7 @@ impl App {
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
         if loading {
+            self.loading_frame = 0;
             self.error = None;
         }
     }
@@ -733,7 +834,7 @@ impl App {
         }
 
         if self.help_visible {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
                 self.help_visible = false;
             }
             return AppAction::None;
@@ -787,6 +888,7 @@ impl App {
                 AppAction::None
             }
             KeyCode::Char('b' | ' ') => self.toggle_selected_bookmark(),
+            KeyCode::Char('m') => self.toggle_selected_read(),
             KeyCode::Char('B') => {
                 self.bookmarks_only = !self.bookmarks_only;
                 self.rebuild_visible_stories();
@@ -798,9 +900,11 @@ impl App {
                 AppAction::SetOffline(self.offline)
             }
             KeyCode::Char('r') => {
-                self.loading = true;
+                self.set_loading(true);
                 AppAction::Refresh
             }
+            KeyCode::Char('n') => AppAction::NextPage,
+            KeyCode::Char('p') => AppAction::PreviousPage,
             KeyCode::Char('L') => {
                 self.layout.mode = self.layout.mode.toggled();
                 self.status = Some(format!("{}-pane layout requested", self.layout.mode));
@@ -1151,7 +1255,8 @@ impl App {
                 let Some(item_id) = self.selected_item().map(|item| item.id) else {
                     return AppAction::None;
                 };
-                self.loading = true;
+                self.read_items.insert(item_id);
+                self.set_loading(true);
                 self.set_focus(FocusPane::Thread);
                 AppAction::LoadThread(item_id)
             }
@@ -1163,16 +1268,20 @@ impl App {
         }
     }
 
-    fn open_selected(&self) -> AppAction {
-        self.selected_item()
-            .map_or(AppAction::None, |item| AppAction::OpenStory(item.id))
+    fn open_selected(&mut self) -> AppAction {
+        let Some(item_id) = self.selected_item().map(|item| item.id) else {
+            return AppAction::None;
+        };
+        self.read_items.insert(item_id);
+        AppAction::OpenStory(item_id)
     }
 
     fn load_selected_article(&mut self) -> AppAction {
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return AppAction::None;
         };
-        self.loading = true;
+        self.read_items.insert(item_id);
+        self.set_loading(true);
         self.set_focus(FocusPane::Detail);
         AppAction::LoadArticle(item_id)
     }
@@ -1189,6 +1298,24 @@ impl App {
         }
     }
 
+    fn toggle_selected_read(&mut self) -> AppAction {
+        let Some(item_id) = self.selected_item().map(|item| item.id) else {
+            return AppAction::None;
+        };
+        let read = if self.read_items.remove(&item_id) {
+            false
+        } else {
+            self.read_items.insert(item_id);
+            true
+        };
+        self.status = Some(if read {
+            "Marked as read".to_owned()
+        } else {
+            "Marked as unread".to_owned()
+        });
+        AppAction::ReadChanged { item_id, read }
+    }
+
     fn choose_feed(&mut self, feed: Feed) -> AppAction {
         self.begin_page_load(feed, None, format!("Loading {}", feed.label()));
         AppAction::LoadFeed(feed)
@@ -1197,6 +1324,8 @@ impl App {
     fn begin_page_load(&mut self, feed: Feed, query: Option<String>, status: String) {
         self.feed = feed;
         self.search_query = query;
+        self.page_index = 0;
+        self.page_size = 30;
         self.stories.clear();
         self.visible_story_indices.clear();
         self.story_selection.reset(0);
@@ -1205,7 +1334,7 @@ impl App {
         self.page_fetched_at = None;
         self.clear_story_context();
         self.set_focus(FocusPane::Stories);
-        self.loading = true;
+        self.set_loading(true);
         self.error = None;
         self.status = Some(status);
     }
@@ -1266,13 +1395,22 @@ impl App {
     }
 
     fn rebuild_visible_stories(&mut self) {
+        let start = self.page_index.saturating_mul(self.page_size);
+        let end = start.saturating_add(self.page_size).min(self.stories.len());
         let indices = self
             .stories
             .iter()
             .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start))
             .filter_map(|(index, item)| self.story_is_visible(item).then_some(index))
             .collect();
         self.visible_story_indices = indices;
+    }
+
+    fn visible_page_len(&self) -> usize {
+        let start = self.page_index.saturating_mul(self.page_size);
+        self.stories.len().saturating_sub(start).min(self.page_size)
     }
 }
 
@@ -1473,6 +1611,90 @@ mod tests {
         let _ = app.handle_key(key(KeyCode::PageDown));
         assert!(app.help_visible());
         assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+    }
+
+    #[test]
+    fn q_closes_help_without_quitting_the_application() {
+        let mut app = App::new(page());
+        assert_eq!(app.handle_key(key(KeyCode::Char('?'))), AppAction::None);
+        assert!(app.help_visible());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::None);
+        assert!(!app.help_visible());
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), AppAction::Quit);
+    }
+
+    #[test]
+    fn loading_animation_advances_only_while_work_is_active() {
+        let mut app = App::new(page());
+        let idle_frame = app.loading_indicator();
+        assert!(!app.advance_loading_animation());
+        assert_eq!(app.loading_indicator(), idle_frame);
+
+        app.set_loading(true);
+        let first = app.loading_indicator();
+        assert!(app.advance_loading_animation());
+        assert_ne!(app.loading_indicator(), first);
+        app.set_loading(false);
+        let stopped = app.loading_indicator();
+        assert!(!app.advance_loading_animation());
+        assert_eq!(app.loading_indicator(), stopped);
+    }
+
+    #[test]
+    fn pagination_keeps_absolute_ranks_and_can_return_to_page_one() {
+        let mut ranked = page();
+        ranked.items = (1..=65)
+            .map(|id| Item {
+                id,
+                title: Some(format!("Story {id}")),
+                ..Item::default()
+            })
+            .collect();
+        let mut app = App::new(ranked.clone());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), AppAction::NextPage);
+        app.set_page_at(ranked, 1, 30);
+        assert_eq!(app.page_index(), 1);
+        assert_eq!(app.visible_item_count(), 30);
+        assert_eq!(app.visible_story_rank(0), Some(31));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(31));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('p'))),
+            AppAction::PreviousPage
+        );
+        assert!(app.show_page(0));
+        assert_eq!(app.page_index(), 0);
+        assert_eq!(app.visible_story_rank(0), Some(1));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+    }
+
+    #[test]
+    fn stories_can_be_marked_read_unread_and_opening_marks_read() {
+        let mut app = App::new(page());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            AppAction::ReadChanged {
+                item_id: 1,
+                read: true,
+            }
+        );
+        assert!(app.is_read(1));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            AppAction::ReadChanged {
+                item_id: 1,
+                read: false,
+            }
+        );
+        assert!(!app.is_read(1));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            AppAction::LoadThread(1)
+        );
+        assert!(app.is_read(1));
     }
 
     #[test]
