@@ -18,6 +18,7 @@ Every runtime dependency has a narrow role:
 | `thiserror` | Typed library and command errors. |
 | `tokio` | Async orchestration, channels, and signal handling. |
 | `tracing`, `tracing-subscriber` | Local opt-in diagnostics; no telemetry. |
+| `unicode-segmentation` | Grapheme-safe wrapping for terminal comment text. |
 | `url` | Strict URL parsing and scheme checks. |
 
 Test-only crates provide statistical benchmarks, temporary storage, and

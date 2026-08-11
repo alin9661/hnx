@@ -6,7 +6,9 @@
    identity/order; Algolia supplies batched records, and bounded Firebase
    requests reconcile gaps. Threads are traversed with cycle, depth, node,
    deadline, response-size, and concurrency limits.
-2. `cache` persists normalized payloads and freshness metadata in SQLite.
+2. `cache` persists normalized payloads, freshness metadata, bookmarks, and
+   per-story read rows in SQLite. Canonical feed ranks survive missing upstream
+   records so pagination never compresses or renumbers later slots.
 3. `config` and `layout` validate preferences, resolve precedence, and compute
    responsive rectangles without terminal or database side effects.
 4. `app` is a deterministic state machine. It does not perform terminal or

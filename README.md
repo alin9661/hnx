@@ -39,8 +39,11 @@ cargo install hnx
 Or install the latest release binary on macOS or Linux:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alin9661/hnx/releases/latest/download/hnx-installer.sh | sh
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -LsSf https://github.com/alin9661/hnx/releases/latest/download/hnx-installer.sh | sh'
 ```
+
+`pipefail` makes a failed download fail the full install command instead of
+letting an empty `sh` invocation report success.
 
 ## Use
 

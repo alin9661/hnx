@@ -32,6 +32,7 @@ tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.12"
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]

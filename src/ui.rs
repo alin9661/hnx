@@ -9,6 +9,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     app::{App, FocusPane, SecondaryPane},
@@ -369,15 +370,21 @@ fn render_thread(
     let offset = app.comment_offset();
     let selected = app.selected_comment_index();
     let row_width = comment_row_width(area, separator);
+    let mut remaining_rows = usize::from(area.height.saturating_sub(1)).max(1);
     let comments: Vec<ListItem<'_>> = app
         .visible_comment_window(offset, capacity)
         .enumerate()
         .map(|(relative, comment)| {
+            let height = comment_height(comment, row_width)
+                .min(remaining_rows)
+                .max(1);
+            remaining_rows = remaining_rows.saturating_sub(height);
             comment_row(
                 comment,
                 app.is_comment_collapsed(comment.id),
                 selected == Some(offset.saturating_add(relative)),
                 row_width,
+                height,
                 theme,
             )
         })
@@ -409,9 +416,10 @@ fn comment_row(
     collapsed: bool,
     selected: bool,
     row_width: usize,
+    max_lines: usize,
     theme: &Theme,
 ) -> ListItem<'static> {
-    let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
+    let depth = comment_depth(comment, row_width);
     let fold = if collapsed {
         "▸"
     } else if comment.kids.is_empty() && comment.children.is_empty() {
@@ -433,8 +441,16 @@ fn comment_row(
     }
     let body = comment_body(comment);
     let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
+    let mut body_lines = wrap_text(&body, body_width.max(1));
+    let truncated = body_lines.len().saturating_add(1) > max_lines;
+    body_lines.truncate(max_lines.saturating_sub(1));
+    if truncated && max_lines == 1 {
+        metadata.push(Span::styled(" …", theme.muted_style()));
+    } else if truncated && let Some(last) = body_lines.last_mut() {
+        "…".clone_into(last);
+    }
     let mut lines = vec![Line::from(metadata)];
-    for body_line in wrap_text(&body, body_width.max(1)) {
+    for body_line in body_lines {
         lines.push(Line::from(
             [
                 depth_rails(depth, theme),
@@ -478,9 +494,15 @@ fn comment_row_width(area: Rect, separator: bool) -> usize {
 }
 
 fn comment_height(comment: &Comment, row_width: usize) -> usize {
-    let depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
+    let depth = comment_depth(comment, row_width);
     let body_width = row_width.saturating_sub(depth.saturating_mul(2).saturating_add(2));
     1_usize.saturating_add(wrap_text(&comment_body(comment), body_width.max(1)).len())
+}
+
+fn comment_depth(comment: &Comment, row_width: usize) -> usize {
+    let semantic_depth = usize::try_from(comment.depth.min(8)).unwrap_or(8);
+    // Preserve room for a double-width grapheme at deep nesting levels.
+    semantic_depth.min(row_width.saturating_sub(4) / 2)
 }
 
 fn comment_body(comment: &Comment) -> String {
@@ -516,14 +538,22 @@ fn wrap_text(input: &str, width: usize) -> Vec<String> {
             line_width = word_width;
             continue;
         }
-        for character in word.chars() {
-            let character_width = Span::raw(character.to_string()).width();
-            if !line.is_empty() && line_width.saturating_add(character_width) > width {
+        for grapheme in word.graphemes(true) {
+            let grapheme_width = Span::raw(grapheme).width();
+            if grapheme_width > width {
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    line_width = 0;
+                }
+                lines.push("…".to_owned());
+                continue;
+            }
+            if !line.is_empty() && line_width.saturating_add(grapheme_width) > width {
                 lines.push(std::mem::take(&mut line));
                 line_width = 0;
             }
-            line.push(character);
-            line_width = line_width.saturating_add(character_width);
+            line.push_str(grapheme);
+            line_width = line_width.saturating_add(grapheme_width);
         }
     }
     if !line.is_empty() {
@@ -993,7 +1023,7 @@ fn strip_html(input: &str) -> String {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Modifier};
 
-    use super::{centered_rect, layout_for, render, status_suffix};
+    use super::{centered_rect, layout_for, render, status_suffix, wrap_text};
     use crate::{
         app::{App, ArticleView, FocusPane, SecondaryPane},
         layout::{LayoutPreferences, PaneMode, ResolvedMode},
@@ -1228,6 +1258,41 @@ mod tests {
         let (_, first_y) = find_run(buffer, "alpha");
         let (_, final_y) = find_run(buffer, "finalword");
         assert!(final_y > first_y, "comment body did not wrap vertically");
+    }
+
+    #[test]
+    fn oversized_comment_keeps_a_visible_truncated_row() {
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("reader".to_owned()),
+                text: Some("wrapped ".repeat(500)),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::classic()))
+            .expect("oversized comment renders");
+        let buffer = terminal.backend().buffer();
+        find_run(buffer, "reader");
+        find_run(buffer, "…");
+    }
+
+    #[test]
+    fn wrapping_keeps_unicode_graphemes_intact() {
+        assert_eq!(wrap_text("👩‍💻👩‍💻", 2), vec!["👩‍💻", "👩‍💻"]);
+        assert_eq!(wrap_text("界", 1), vec!["…"]);
     }
 
     #[test]
