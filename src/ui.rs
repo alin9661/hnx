@@ -653,7 +653,21 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("/ search · f filter · b save · B saved only"),
         Line::raw("a article · o browser · O offline · r refresh"),
     ];
-    let help = if area.height < 24 {
+    let narrow_help = vec![
+        Line::styled("?/Esc close", theme.accent_style()),
+        Line::raw("Nav j/k h/l"),
+        Line::raw("Tab cycle"),
+        Line::raw("Enter open"),
+        Line::raw("Layout L"),
+        Line::raw("Resize Alt-h/l"),
+        Line::raw("Find / f"),
+        Line::raw("Save b B"),
+        Line::raw("Read a o"),
+        Line::raw("More O r"),
+    ];
+    let help = if area.width < 40 {
+        narrow_help
+    } else if area.height < 24 {
         compact_help
     } else {
         full_help
@@ -759,8 +773,10 @@ fn status_suffix(mode: ResolvedMode, focus: FocusPane, hints: &str, width: u16) 
     }
     if compact_recovery.chars().count() <= usize::from(width) {
         compact_recovery.to_owned()
+    } else if width > 0 {
+        "q".to_owned()
     } else {
-        " q ".to_owned()
+        String::new()
     }
 }
 
@@ -1360,6 +1376,64 @@ mod tests {
                 );
             }
         }
+
+        for width in [1, 2, 6, 7, 16] {
+            let backend = TestBackend::new(width, 3);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("tiny status renders");
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .any(|cell| cell.symbol() == "q"),
+                "quit cue missing at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_comment_uses_custom_primary_foreground_but_muted_fold() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: vec![Comment {
+                id: 10,
+                by: Some("selected-commenter".to_owned()),
+                text: Some("selected comment body".to_owned()),
+                ..Comment::default()
+            }],
+            source: Source::Cache,
+            stale: false,
+            fetched_at: 1,
+        });
+        let mut theme = Theme::midnight();
+        theme.selected_fg = ratatui::style::Color::Rgb(247, 17, 219);
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("selected comment renders");
+        let buffer = terminal.backend().buffer();
+
+        assert!(cells_for(buffer, "selected-commenter").all(|cell| cell.fg == theme.selected_fg));
+        assert!(
+            cells_for(buffer, "selected comment body").all(|cell| cell.fg == theme.selected_fg)
+        );
+        let (author_x, author_y) = find_run(buffer, "selected-commenter");
+        assert_eq!(
+            buffer
+                .cell((author_x.saturating_sub(2), author_y))
+                .map(|cell| cell.fg),
+            Some(theme.muted)
+        );
     }
 
     #[test]
@@ -1386,6 +1460,35 @@ mod tests {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} at height {height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_short_help_keeps_its_dismissal_cue_visible() {
+        for width in [20, 30] {
+            let backend = TestBackend::new(width, 12);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::new(page());
+            let _ = app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('?'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::classic()))
+                .expect("narrow help renders");
+            let rendered = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            for expected in ["?/Esc close", "Nav j/k", "Layout L", "Find / f"] {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected} at width {width}"
                 );
             }
         }
