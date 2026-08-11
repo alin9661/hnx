@@ -1136,12 +1136,14 @@ async fn run_tui(
     let mut thread_request_id = 0_u64;
     let mut article_request_id = 0_u64;
     let mut page_task: Option<JoinHandle<()>> = None;
+    let mut pending_page_index = 0_usize;
     let mut thread_task: Option<JoinHandle<()>> = None;
     let mut article_task: Option<JoinHandle<()>> = None;
 
     if !offline {
         page_request_id = next_request_id(page_request_id);
         app.set_loading(true);
+        pending_page_index = 0;
         page_task = Some(spawn_feed(
             sender.clone(),
             client.clone(),
@@ -1227,6 +1229,7 @@ async fn run_tui(
                                     } else {
                                         app.set_loading(true);
                                         let limit = refresh_limit(&app);
+                                        pending_page_index = 0;
                                         page_task = Some(spawn_feed(
                                             sender.clone(), client.clone(), cache.clone(), feed,
                                             limit, 0, page_request_id,
@@ -1257,6 +1260,7 @@ async fn run_tui(
                                         } else {
                                             app.set_loading(true);
                                             let limit = refresh_limit(&app);
+                                            pending_page_index = 0;
                                             page_task = Some(spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
                                                 limit, 0, page_request_id,
@@ -1273,6 +1277,7 @@ async fn run_tui(
                                         app.set_loading(true);
                                         let page_index = app.page_index();
                                         let limit = refresh_limit(&app);
+                                        pending_page_index = page_index;
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
@@ -1317,6 +1322,7 @@ async fn run_tui(
                                             }
                                         } else {
                                             app.set_loading(true);
+                                            pending_page_index = target_page;
                                             page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                                 spawn_search(
                                                     sender.clone(), client.clone(), cache.clone(), query,
@@ -1334,15 +1340,23 @@ async fn run_tui(
                                     }
                                 }
                                 AppAction::PreviousPage => {
-                                    page_request_id = next_request_id(page_request_id);
-                                    thread_request_id = next_request_id(thread_request_id);
-                                    article_request_id = next_request_id(article_request_id);
-                                    abort_task(&mut page_task);
-                                    abort_task(&mut thread_task);
-                                    abort_task(&mut article_task);
                                     if app.page_index() == 0 {
+                                        if should_cancel_pending_next(
+                                            app.page_index(),
+                                            page_task.is_some(),
+                                            pending_page_index,
+                                        ) {
+                                            page_request_id = next_request_id(page_request_id);
+                                            abort_task(&mut page_task);
+                                        }
                                         app.set_status("Already on the first page");
                                     } else {
+                                        page_request_id = next_request_id(page_request_id);
+                                        thread_request_id = next_request_id(thread_request_id);
+                                        article_request_id = next_request_id(article_request_id);
+                                        abort_task(&mut page_task);
+                                        abort_task(&mut thread_task);
+                                        abort_task(&mut article_task);
                                         let _ = app.show_page(app.page_index().saturating_sub(1));
                                     }
                                 }
@@ -1402,6 +1416,7 @@ async fn run_tui(
                                         app.set_loading(true);
                                         let page_index = app.page_index();
                                         let limit = refresh_limit(&app);
+                                        pending_page_index = page_index;
                                         page_task = Some(if let Some(query) = app.search_query().map(str::to_owned) {
                                             spawn_search(
                                                 sender.clone(), client.clone(), cache.clone(), query,
@@ -1652,6 +1667,10 @@ fn refresh_limit(app: &App) -> usize {
         .min(MAX_LIMIT)
 }
 
+fn should_cancel_pending_next(current_page: usize, task_active: bool, pending_page: usize) -> bool {
+    task_active && pending_page > current_page
+}
+
 fn abort_task(task: &mut Option<JoinHandle<()>>) {
     if let Some(task) = task.take() {
         task.abort();
@@ -1774,8 +1793,8 @@ mod tests {
         CleanupGuard, Cli, CliError, Command, LAYOUT_SETTING_KEY, OutputFormat, PageContext,
         apply_requested_layout, cleanup_once, combine_warnings, config_input_error,
         handle_open_story, next_request_id, page_limit, parse_item_id, parse_limit,
-        parse_search_query, persist_layout_action, refresh_limit, write_buffered, write_comments,
-        write_item, write_json, write_page, write_thread,
+        parse_search_query, persist_layout_action, refresh_limit, should_cancel_pending_next,
+        write_buffered, write_comments, write_item, write_json, write_page, write_thread,
     };
     use crate::{
         api::SearchType,
@@ -2006,6 +2025,13 @@ mod tests {
         page.items.truncate(30);
         app.refresh_page(page);
         assert_eq!(refresh_limit(&app), 30);
+    }
+
+    #[test]
+    fn previous_cancels_forward_navigation_but_not_the_initial_refresh() {
+        assert!(should_cancel_pending_next(0, true, 1));
+        assert!(!should_cancel_pending_next(0, true, 0));
+        assert!(!should_cancel_pending_next(0, false, 1));
     }
 
     #[test]
