@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::model::{Feed, Item, Source, StoryPage, Thread};
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 /// Conservative upper bound for one serialized cache value.
 pub const MAX_CACHE_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -107,6 +107,7 @@ pub struct CacheStats {
     pub threads: u64,
     pub searches: u64,
     pub bookmarks: u64,
+    pub read_items: u64,
     pub settings: u64,
     pub stale_entries: u64,
     pub payload_bytes: u64,
@@ -121,7 +122,7 @@ impl CacheStats {
 
     #[must_use]
     pub const fn total_rows(self) -> u64 {
-        self.cache_entries() + self.bookmarks + self.settings
+        self.cache_entries() + self.bookmarks + self.read_items + self.settings
     }
 }
 
@@ -243,7 +244,7 @@ impl Cache {
         self.put_feed_encoded(
             page.feed,
             &payload,
-            page.items.len(),
+            page.covered_slots(),
             &item_rows,
             fetched_at,
             ttl,
@@ -328,7 +329,7 @@ impl Cache {
                  fetched_at = excluded.fetched_at,
                  expires_at = excluded.expires_at,
                  item_count = excluded.item_count
-             WHERE excluded.item_count >= feeds.item_count",
+             WHERE excluded.fetched_at >= feeds.fetched_at",
             params![
                 feed.as_str(),
                 payload,
@@ -509,7 +510,7 @@ impl Cache {
         self.put_search_encoded(
             query,
             &payload,
-            page.items.len(),
+            page.covered_slots(),
             &item_rows,
             fetched_at,
             ttl,
@@ -591,7 +592,7 @@ impl Cache {
                  fetched_at = excluded.fetched_at,
                  expires_at = excluded.expires_at,
                  item_count = excluded.item_count
-             WHERE excluded.item_count >= searches.item_count",
+             WHERE excluded.fetched_at >= searches.fetched_at",
             params![
                 query,
                 payload,
@@ -677,6 +678,36 @@ impl Cache {
             .collect()
     }
 
+    /// Marks one story as read. Per-item rows make concurrent UI sessions
+    /// independent instead of replacing one shared serialized set.
+    pub fn set_read(&self, id: u64) -> CacheResult<()> {
+        self.lock()?.execute(
+            "INSERT INTO read_items (item_id, read_at) VALUES (?1, ?2)
+             ON CONFLICT(item_id) DO UPDATE SET read_at = excluded.read_at",
+            params![sqlite_id(id)?, current_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_read(&self, id: u64) -> CacheResult<bool> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM read_items WHERE item_id = ?1",
+            [sqlite_id(id)?],
+        )? > 0)
+    }
+
+    pub fn read_items(&self) -> CacheResult<Vec<u64>> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare("SELECT item_id FROM read_items ORDER BY read_at, item_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.map(|row| {
+            let id = row?;
+            u64::try_from(id).map_err(|_| CacheError::InvalidItemId(u64::MAX))
+        })
+        .collect()
+    }
+
     /// Writes an application setting as an opaque UTF-8 value.
     pub fn set_setting(&self, key: &str, value: &str) -> CacheResult<()> {
         let key = validate_key(key, MAX_SETTING_KEY_BYTES, "setting key")?;
@@ -742,6 +773,7 @@ impl Cache {
             threads: count_rows(&connection, "threads")?,
             searches: count_rows(&connection, "searches")?,
             bookmarks: count_rows(&connection, "bookmarks")?,
+            read_items: count_rows(&connection, "read_items")?,
             settings: count_rows(&connection, "settings")?,
             stale_entries: 0,
             payload_bytes: 0,
@@ -775,7 +807,7 @@ impl Cache {
 
     /// Deletes expired feed, item, thread, and search rows.
     ///
-    /// Bookmarks and settings are deliberately not affected.
+    /// Bookmarks, read state, and settings are deliberately not affected.
     pub fn prune(&self) -> CacheResult<PruneStats> {
         self.prune_expired_at(current_timestamp())
     }
@@ -805,7 +837,7 @@ impl Cache {
         Ok(stats)
     }
 
-    /// Clears cached network data, bookmarks, and settings.
+    /// Clears cached network data, bookmarks, read state, and settings.
     ///
     /// This intentionally destructive variant is named separately so the
     /// ordinary `clear` operation cannot erase user-owned state.
@@ -814,9 +846,10 @@ impl Cache {
         let transaction = connection.transaction()?;
         let cache_rows = clear_cache_tables(&transaction)?.total();
         let bookmarks = transaction.execute("DELETE FROM bookmarks", [])?;
+        let read_items = transaction.execute("DELETE FROM read_items", [])?;
         let settings = transaction.execute("DELETE FROM settings", [])?;
         transaction.commit()?;
-        Ok(cache_rows + bookmarks + settings)
+        Ok(cache_rows + bookmarks + read_items + settings)
     }
 
     fn read_entry<T: DeserializeOwned, P: rusqlite::Params>(
@@ -940,6 +973,19 @@ fn migrate_connection(connection: &mut Connection) -> CacheResult<()> {
         transaction.execute_batch("PRAGMA user_version = 3;")?;
     }
 
+    if version < 4 {
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS read_items (
+                 item_id INTEGER PRIMARY KEY NOT NULL CHECK(item_id >= 0),
+                 read_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS read_items_order_idx
+                 ON read_items(read_at, item_id);",
+        )?;
+        record_migration(&transaction, 4)?;
+        transaction.execute_batch("PRAGMA user_version = 4;")?;
+    }
+
     transaction.commit()?;
     Ok(())
 }
@@ -1007,6 +1053,7 @@ fn count_rows(connection: &Connection, table: &str) -> CacheResult<u64> {
         "threads" => "SELECT COUNT(*) FROM threads",
         "searches" => "SELECT COUNT(*) FROM searches",
         "bookmarks" => "SELECT COUNT(*) FROM bookmarks",
+        "read_items" => "SELECT COUNT(*) FROM read_items",
         "settings" => "SELECT COUNT(*) FROM settings",
         _ => return Err(CacheError::InvalidKey("unknown cache table")),
     };
@@ -1046,7 +1093,7 @@ fn metadata_from_values(
 fn serialized_story_count(payload: &[u8]) -> Option<usize> {
     serde_json::from_slice::<StoryPage>(payload)
         .ok()
-        .map(|page| page.items.len())
+        .map(|page| page.covered_slots())
 }
 
 fn sqlite_count(count: usize) -> i64 {
@@ -1198,7 +1245,27 @@ mod tests {
     }
 
     #[test]
-    fn smaller_feed_and_search_puts_do_not_replace_larger_pages() {
+    fn ranked_prefix_coverage_survives_an_unreadable_slot() {
+        let cache = Cache::open_in_memory().expect("cache opens");
+        let mut ranked = page(Feed::Top, 59, current_timestamp());
+        for (index, item) in ranked.items.iter_mut().enumerate() {
+            let rank = if index < 29 { index + 1 } else { index + 2 };
+            item.rank = Some(rank);
+        }
+
+        cache
+            .put_feed(&ranked, Duration::from_secs(60))
+            .expect("ranked page stores");
+        let cached = cache
+            .get_feed_for_limit(Feed::Top, 60)
+            .expect("ranked page reads")
+            .expect("sixty upstream slots are covered");
+        assert_eq!(cached.metadata.item_count, Some(60));
+        assert_eq!(cached.value.items.len(), 59);
+    }
+
+    #[test]
+    fn newer_smaller_feed_and_search_puts_replace_stale_larger_pages() {
         let cache = Cache::open_in_memory().expect("cache opens");
         let now = current_timestamp();
         let large = page(Feed::Top, 30, now);
@@ -1208,30 +1275,52 @@ mod tests {
         cache
             .put_feed(&large, Duration::from_secs(60))
             .expect("large feed stores");
-        let retained_feed_metadata = cache
+        let replaced_feed_metadata = cache
             .put_feed(&small, Duration::from_secs(120))
-            .expect("smaller feed put is safely ignored");
-        let retained_feed = cache
-            .get_feed_for_limit(Feed::Top, 30)
+            .expect("newer smaller feed replaces");
+        assert!(
+            cache
+                .get_feed_for_limit(Feed::Top, 30)
+                .expect("feed reads")
+                .is_none()
+        );
+        let replaced_feed = cache
+            .get_feed_for_limit(Feed::Top, 1)
             .expect("feed reads")
-            .expect("large feed remains");
-        assert_eq!(retained_feed.value.items.len(), 30);
-        assert_eq!(retained_feed_metadata.fetched_at, now);
-        assert_eq!(retained_feed_metadata.item_count, Some(30));
+            .expect("small feed remains");
+        assert_eq!(replaced_feed.value.items.len(), 1);
+        assert_eq!(replaced_feed_metadata.fetched_at, now + 1);
+        assert_eq!(replaced_feed_metadata.item_count, Some(1));
+        let still_newer = cache
+            .put_feed(&large, Duration::from_secs(60))
+            .expect("older completion is ignored");
+        assert_eq!(still_newer.fetched_at, now + 1);
+        assert_eq!(still_newer.item_count, Some(1));
 
         cache
             .put_search("rust", &large, Duration::from_secs(60))
             .expect("large search stores");
-        let retained_search_metadata = cache
+        let replaced_search_metadata = cache
             .put_search("rust", &small, Duration::from_secs(120))
-            .expect("smaller search put is safely ignored");
-        let retained_search = cache
-            .get_search_for_limit("rust", 30)
+            .expect("newer smaller search replaces");
+        assert!(
+            cache
+                .get_search_for_limit("rust", 30)
+                .expect("search reads")
+                .is_none()
+        );
+        let replaced_search = cache
+            .get_search_for_limit("rust", 1)
             .expect("search reads")
-            .expect("large search remains");
-        assert_eq!(retained_search.value.items.len(), 30);
-        assert_eq!(retained_search_metadata.fetched_at, now);
-        assert_eq!(retained_search_metadata.item_count, Some(30));
+            .expect("small search remains");
+        assert_eq!(replaced_search.value.items.len(), 1);
+        assert_eq!(replaced_search_metadata.fetched_at, now + 1);
+        assert_eq!(replaced_search_metadata.item_count, Some(1));
+        let still_newer = cache
+            .put_search("rust", &large, Duration::from_secs(60))
+            .expect("older search completion is ignored");
+        assert_eq!(still_newer.fetched_at, now + 1);
+        assert_eq!(still_newer.item_count, Some(1));
     }
 
     #[test]
@@ -1339,7 +1428,7 @@ mod tests {
         drop(connection);
 
         let cache = Cache::open(&path).expect("legacy database migrates");
-        assert_eq!(cache.schema_version().expect("version reads"), 3);
+        assert_eq!(cache.schema_version().expect("version reads"), 4);
         assert_eq!(
             cache
                 .get_feed(Feed::Best)
@@ -1373,6 +1462,7 @@ mod tests {
             .put_item(&story, Duration::from_secs(60))
             .expect("item stores");
         cache.add_bookmark(&story).expect("bookmark stores");
+        cache.set_read(story.id).expect("read state stores");
         cache
             .set_setting("theme", "midnight")
             .expect("setting stores");
@@ -1382,6 +1472,7 @@ mod tests {
             story
         );
         assert!(cache.is_bookmarked(42).expect("bookmark checks"));
+        assert_eq!(cache.read_items().expect("read state reads"), vec![42]);
         assert_eq!(cache.bookmarks().expect("bookmarks read"), vec![story]);
         assert_eq!(
             cache
@@ -1417,6 +1508,7 @@ mod tests {
             .put_item(&story, Duration::from_secs(60))
             .expect("item stores");
         cache.add_bookmark(&story).expect("bookmark stores");
+        cache.set_read(story.id).expect("read state stores");
         cache
             .set_setting("theme", "classic")
             .expect("setting stores");
@@ -1425,7 +1517,26 @@ mod tests {
         let stats = cache.stats().expect("stats read");
         assert_eq!(stats.cache_entries(), 0);
         assert_eq!(stats.bookmarks, 1);
+        assert_eq!(stats.read_items, 1);
         assert_eq!(stats.settings, 1);
+    }
+
+    #[test]
+    fn concurrent_handles_do_not_replace_unrelated_read_items() {
+        let directory = tempfile::tempdir().expect("tempdir creates");
+        let path = directory.path().join("shared.sqlite3");
+        let first = Cache::open(&path).expect("first cache opens");
+        let second = Cache::open(&path).expect("second cache opens");
+
+        first.set_read(1).expect("first process marks read");
+        second.set_read(2).expect("second process marks read");
+        assert_eq!(
+            first.read_items().expect("combined state reads"),
+            vec![1, 2]
+        );
+
+        second.remove_read(2).expect("second process marks unread");
+        assert_eq!(first.read_items().expect("remaining state reads"), vec![1]);
     }
 
     #[test]
