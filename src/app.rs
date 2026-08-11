@@ -188,6 +188,12 @@ impl Selection {
         self.move_by(pages.saturating_mul(amount), len);
     }
 
+    fn half_page_by(&mut self, pages: isize, len: usize) {
+        let half_viewport = self.viewport.div_ceil(2).max(1);
+        let amount = isize::try_from(half_viewport).unwrap_or(isize::MAX);
+        self.move_by(pages.saturating_mul(amount), len);
+    }
+
     fn first(&mut self, len: usize) {
         if len > 0 {
             self.index = Some(0);
@@ -232,6 +238,8 @@ pub struct App {
     story_selection: Selection,
     comment_selection: Selection,
     detail_scroll: u16,
+    detail_viewport: usize,
+    detail_max_scroll: u16,
     filter: String,
     filter_regex: Option<regex::Regex>,
     search_query: Option<String>,
@@ -278,6 +286,8 @@ impl App {
             story_selection: Selection::empty(),
             comment_selection: Selection::empty(),
             detail_scroll: 0,
+            detail_viewport: 1,
+            detail_max_scroll: 0,
             filter: String::new(),
             filter_regex: None,
             search_query: None,
@@ -689,6 +699,14 @@ impl App {
             .set_viewport(comment_rows, comment_count);
     }
 
+    /// Records the rendered Detail extent and clamps scroll after content or width changes.
+    pub(crate) fn set_detail_metrics(&mut self, viewport_rows: usize, content_rows: usize) {
+        self.detail_viewport = viewport_rows.max(1);
+        self.detail_max_scroll =
+            u16::try_from(content_rows.saturating_sub(self.detail_viewport)).unwrap_or(u16::MAX);
+        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
+    }
+
     /// Maps a terminal key event into a state transition and optional I/O action.
     #[must_use]
     #[allow(clippy::too_many_lines)]
@@ -712,6 +730,20 @@ impl App {
                 self.help_visible = false;
             }
             return AppAction::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    self.half_page_selection(1);
+                    return AppAction::None;
+                }
+                KeyCode::Char('u') => {
+                    self.half_page_selection(-1);
+                    return AppAction::None;
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -781,12 +813,16 @@ impl App {
                 self.select_last();
                 AppAction::None
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.set_focus(self.focus.next());
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.toggle_panel_focus();
                 AppAction::None
             }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.set_focus(self.focus.previous());
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.focus_secondary_panel();
+                AppAction::None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.set_focus(FocusPane::Stories);
                 AppAction::None
             }
             KeyCode::Char('[') => self.change_feed(-1),
@@ -971,14 +1007,54 @@ impl App {
                 self.comment_selection.page_by(pages, len);
             }
             FocusPane::Detail => {
-                let delta =
-                    i16::try_from(pages.saturating_mul(12)).unwrap_or(if pages.is_negative() {
-                        i16::MIN
-                    } else {
-                        i16::MAX
-                    });
-                self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
+                self.scroll_detail_by(pages, self.detail_viewport);
             }
+        }
+    }
+
+    fn half_page_selection(&mut self, pages: isize) {
+        match self.focus {
+            FocusPane::Stories => {
+                let selected_id = self.selected_item().map(|item| item.id);
+                let len = self.visible_item_count();
+                self.story_selection.half_page_by(pages, len);
+                if self.selected_item().map(|item| item.id) != selected_id {
+                    self.clear_story_context();
+                }
+            }
+            FocusPane::Thread => {
+                let len = self.comment_count();
+                self.comment_selection.half_page_by(pages, len);
+            }
+            FocusPane::Detail => {
+                self.scroll_detail_by(pages, self.detail_viewport.div_ceil(2).max(1));
+            }
+        }
+    }
+
+    fn scroll_detail_by(&mut self, pages: isize, rows: usize) {
+        let distance = pages.unsigned_abs().saturating_mul(rows);
+        let distance = u16::try_from(distance).unwrap_or(u16::MAX);
+        self.detail_scroll = if pages.is_negative() {
+            self.detail_scroll.saturating_sub(distance)
+        } else {
+            self.detail_scroll.saturating_add(distance)
+        }
+        .min(self.detail_max_scroll);
+    }
+
+    fn focus_secondary_panel(&mut self) {
+        self.set_focus(match self.secondary {
+            SecondaryPane::Thread => FocusPane::Thread,
+            SecondaryPane::Detail => FocusPane::Detail,
+        });
+    }
+
+    fn toggle_panel_focus(&mut self) {
+        if self.focus == FocusPane::Stories {
+            self.focus_secondary_panel();
+        } else {
+            self.set_focus(FocusPane::Stories);
         }
     }
 
@@ -1201,6 +1277,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn selection_and_scroll_follow_viewport() {
         let mut app = App::new(page());
@@ -1215,6 +1295,178 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::PageUp)), AppAction::None);
         assert_eq!(app.selected_item().map(|item| item.id), Some(3));
         assert_eq!(app.story_offset(), 2);
+    }
+
+    #[test]
+    fn vim_half_pages_and_physical_keys_page_the_story_viewport() {
+        let mut app = App::new(page());
+        app.set_viewports(5, 5);
+
+        assert_eq!(
+            app.handle_key(ctrl_key(KeyCode::Char('d'))),
+            AppAction::None
+        );
+        assert_eq!(app.selected_item().map(|item| item.id), Some(4));
+        assert_eq!(app.focus(), FocusPane::Stories);
+
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(8));
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(5));
+
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+    }
+
+    #[test]
+    fn paging_story_selection_clears_dependent_content() {
+        let mut app = App::new(page());
+        let selected = app.selected_item().cloned().expect("story is selected");
+        app.load_thread(Thread {
+            item: selected,
+            comments: Vec::new(),
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 43,
+        });
+        app.set_focus(FocusPane::Stories);
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+
+        assert_eq!(app.selected_item().map(|item| item.id), Some(4));
+        assert!(app.thread().is_none());
+        assert_eq!(app.source(), Some(Source::Algolia));
+    }
+
+    #[test]
+    fn paging_saturates_at_story_and_detail_boundaries() {
+        let mut app = App::new(page());
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+
+        let _ = app.handle_key(key(KeyCode::End));
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(8));
+
+        app.set_focus(FocusPane::Detail);
+        app.set_detail_metrics(7, usize::MAX);
+        app.detail_scroll = u16::MAX - 2;
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.detail_scroll(), u16::MAX);
+        let _ = app.handle_key(key(KeyCode::Home));
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn detail_paging_uses_its_actual_viewport() {
+        let mut app = App::new(page());
+        app.set_focus(FocusPane::Detail);
+        app.set_detail_metrics(7, 30);
+
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.detail_scroll(), 7);
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        assert_eq!(app.detail_scroll(), 11);
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.detail_scroll(), 7);
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn plain_d_focuses_detail_while_ctrl_d_pages() {
+        let mut app = App::new(page());
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        assert_eq!(app.selected_item().map(|item| item.id), Some(4));
+
+        let _ = app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+    }
+
+    #[test]
+    fn prompts_and_help_block_paging_keys() {
+        let mut app = App::new(page());
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(key(KeyCode::Char('/')));
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+        assert_eq!(app.prompt().map(|prompt| prompt.value.as_str()), Some(""));
+
+        let _ = app.handle_key(key(KeyCode::Esc));
+        let _ = app.handle_key(key(KeyCode::Char('?')));
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert!(app.help_visible());
+        assert_eq!(app.selected_item().map(|item| item.id), Some(1));
+    }
+
+    #[test]
+    fn horizontal_keys_move_between_two_physical_panels() {
+        let mut app = App::new(page());
+
+        let _ = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus(), FocusPane::Thread);
+        let _ = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus(), FocusPane::Stories);
+
+        let _ = app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.focus(), FocusPane::Stories);
+        let _ = app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.focus(), FocusPane::Detail);
+        let _ = app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus(), FocusPane::Stories);
+
+        let _ = app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.focus(), FocusPane::Thread);
+        assert_eq!(app.secondary_pane(), super::SecondaryPane::Thread);
+    }
+
+    #[test]
+    fn thread_focus_uses_half_and_full_viewport_paging() {
+        let mut app = App::new(page());
+        app.load_thread(Thread {
+            item: Item {
+                id: 1,
+                ..Item::default()
+            },
+            comments: (10..=17)
+                .map(|id| Comment {
+                    id,
+                    ..Comment::default()
+                })
+                .collect(),
+            source: Source::Firebase,
+            stale: false,
+            fetched_at: 43,
+        });
+        app.set_viewports(5, 5);
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('d')));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(13));
+
+        let _ = app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(17));
+
+        let _ = app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(14));
+
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        let _ = app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected_comment().map(|comment| comment.id), Some(10));
     }
 
     #[test]

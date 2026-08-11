@@ -38,7 +38,7 @@ The first integrated release-mode run on the same machine produced:
 | --- | ---: |
 | Hybrid Top, 30 items, five fresh-cache samples | 0.32 s median (0.30–0.67 s) |
 | Warm offline Top JSON, 100 sequential processes | 4.9 ms mean per process |
-| 10k-comment navigation + 120x40 frame | 134.9 µs median; 140.6 µs sample p95 |
+| 10k-comment navigation + 120x40 two-panel frame | 181.8 µs median; 201.7 µs sample p95 |
 | Stripped release binary | 9.06 MB |
 | `hnx --version` peak RSS | 7.8 MB |
 

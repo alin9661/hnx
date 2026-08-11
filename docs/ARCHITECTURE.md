@@ -8,7 +8,9 @@
    deadline, response-size, and concurrency limits.
 2. `cache` persists normalized payloads and freshness metadata in SQLite.
 3. `app` is a deterministic state machine. It does not perform terminal I/O.
-4. `ui` renders an `app` snapshot into adaptive Ratatui layouts.
+4. `ui` renders `app` state into adaptive Ratatui layouts and records rendered
+   viewport/content metrics back into `App` so Detail scrolling stays bounded
+   after content wrapping or terminal resize.
 5. `cli` coordinates cache-first reads, background refreshes, machine-readable
    output, and terminal lifecycle.
 

@@ -23,9 +23,9 @@ pub const MEDIUM_MIN_WIDTH: u16 = 80;
 /// The responsive content arrangement selected for a terminal width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Story list, thread, and article/detail panes.
+    /// Story list and the active secondary pane at the wide breakpoint.
     Wide,
-    /// Story list and the most recently focused secondary pane.
+    /// Story list and the active secondary pane.
     Medium,
     /// Only the focused pane.
     Narrow,
@@ -81,11 +81,7 @@ pub fn layout_for(area: Rect, focus: FocusPane, secondary: SecondaryPane) -> UiL
     );
 
     let (stories, thread, detail) = match mode {
-        LayoutMode::Wide => {
-            let [stories, thread, detail] = split_three(content, 38, 34);
-            (Some(stories), Some(thread), Some(detail))
-        }
-        LayoutMode::Medium => {
+        LayoutMode::Wide | LayoutMode::Medium => {
             let [stories, secondary_area] = split_two(content, 44);
             match secondary {
                 SecondaryPane::Thread => (Some(stories), Some(secondary_area), None),
@@ -163,27 +159,6 @@ fn split_two(area: Rect, left_percent: u16) -> [Rect; 2] {
     ]
 }
 
-fn split_three(area: Rect, first_percent: u16, second_percent: u16) -> [Rect; 3] {
-    let first_width = area.width.saturating_mul(first_percent) / 100;
-    let second_width = area.width.saturating_mul(second_percent) / 100;
-    let used = first_width.saturating_add(second_width).min(area.width);
-    [
-        Rect::new(area.x, area.y, first_width, area.height),
-        Rect::new(
-            area.x.saturating_add(first_width),
-            area.y,
-            second_width.min(area.width.saturating_sub(first_width)),
-            area.height,
-        ),
-        Rect::new(
-            area.x.saturating_add(used),
-            area.y,
-            area.width.saturating_sub(used),
-            area.height,
-        ),
-    ]
-}
-
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -193,25 +168,30 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .position(|feed| *feed == app.feed())
         .unwrap_or_default();
     let titles = Feed::ALL.map(|feed| Line::from(feed.label()));
-    let title = app.search_query().map_or_else(
-        || " hnx ".to_owned(),
-        |query| format!(" hnx · “{}” ", sanitize_single_line(query)),
-    );
+    let mut title = vec![Span::styled(
+        " hnx ",
+        Style::default()
+            .fg(theme.accent_fg)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(query) = app.search_query() {
+        title.push(Span::styled(
+            format!(" · “{}” ", sanitize_single_line(query)),
+            theme.muted_style(),
+        ));
+    }
     let tabs = Tabs::new(titles)
         .select(selected)
         .divider(Span::styled(" │ ", Style::default().fg(theme.border)))
         .block(
             Block::default()
-                .title(title)
+                .title(Line::from(title))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border)),
         )
         .style(theme.muted_style())
-        .highlight_style(
-            theme
-                .accent_style()
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        );
+        .highlight_style(theme.selected_style().add_modifier(Modifier::BOLD));
     frame.render_widget(tabs, area);
 }
 
@@ -406,7 +386,7 @@ fn comment_row(comment: &Comment, collapsed: bool, theme: &Theme) -> ListItem<'s
     ])
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
     if area.is_empty() {
         return;
     }
@@ -444,13 +424,13 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         ));
     }
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll(), 0)),
-        area,
-    );
+    let text = Text::from(lines);
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let content_rows = paragraph.line_count(inner.width);
+    app.set_detail_metrics(usize::from(inner.height), content_rows);
+    let paragraph = paragraph.block(block).scroll((app.detail_scroll(), 0));
+    frame.render_widget(paragraph, area);
 }
 
 fn comment_detail(comment: &Comment, theme: &Theme) -> Vec<Line<'static>> {
@@ -570,11 +550,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, mode: LayoutMode,
     let mut lines = vec![Line::from(state)];
     if area.height > 1 {
         let keys = if area.width >= WIDE_MIN_WIDTH {
-            " ? help  q quit  j/k move  Tab pane  Enter load/fold  a read  o open  / search  f filter  b save  O offline "
+            " ? help  q quit  j/k move  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane  Enter select  a read  o open "
         } else if area.width >= MEDIUM_MIN_WIDTH {
-            " ? help  q quit  j/k move  Tab pane  Enter select  / search  b save "
+            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page  Tab pane "
         } else {
-            " ? help  q quit  j/k move  Tab pane "
+            " ? help  q quit  Ctrl+U/D half-page  PgUp/PgDn page "
         };
         lines.push(Line::styled(keys, theme.muted_style()));
     }
@@ -592,6 +572,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::raw("j/k or ↑/↓   move selection / scroll article"),
         Line::raw("h/l or ←/→   move between panes"),
         Line::raw("Tab           next pane"),
+        Line::raw("Ctrl+U/D      half-page up/down"),
+        Line::raw("PgUp/PgDn     full page up/down"),
         Line::raw("Enter         load story thread / fold comment"),
         Line::raw("[/] or 1–6    switch feed"),
         Line::raw(""),
@@ -609,7 +591,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
                 Block::default()
                     .title(" Keyboard help ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
+                    .border_style(Style::default().fg(theme.highlight)),
             )
             .style(Style::default().fg(theme.foreground).bg(theme.background))
             .wrap(Wrap { trim: false }),
@@ -635,7 +617,7 @@ fn render_prompt(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
                         prompt.kind.label()
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.accent)),
+                    .border_style(Style::default().fg(theme.highlight)),
             )
             .style(Style::default().fg(theme.foreground).bg(theme.background)),
         popup,
@@ -675,8 +657,7 @@ fn centered_rect(area: Rect, percent_width: u16, desired_height: u16) -> Rect {
 
 fn mode_label(mode: LayoutMode) -> &'static str {
     match mode {
-        LayoutMode::Wide => "3-pane",
-        LayoutMode::Medium => "2-pane",
+        LayoutMode::Wide | LayoutMode::Medium => "2-pane",
         LayoutMode::Narrow => "1-pane",
     }
 }
@@ -761,9 +742,9 @@ fn strip_html(input: &str) -> String {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
-    use super::{LayoutMode, layout_for, render};
+    use super::{LayoutMode, centered_rect, layout_for, render};
     use crate::{
-        app::{App, FocusPane, SecondaryPane},
+        app::{App, ArticleView, FocusPane, SecondaryPane},
         model::{Comment, Feed, Item, Source, StoryPage, Thread},
         theme::Theme,
     };
@@ -796,27 +777,40 @@ mod tests {
     }
 
     #[test]
-    fn wide_medium_and_narrow_expose_three_two_and_one_content_panes() {
-        let wide = layout_for(
-            Rect::new(0, 0, 120, 30),
-            FocusPane::Stories,
-            SecondaryPane::Thread,
-        );
-        assert!(wide.stories.is_some() && wide.thread.is_some() && wide.detail.is_some());
+    fn wide_and_medium_render_stories_with_the_active_secondary_pane() {
+        for width in [120, 119, 80] {
+            let thread = layout_for(
+                Rect::new(0, 0, width, 30),
+                FocusPane::Stories,
+                SecondaryPane::Thread,
+            );
+            let stories = thread.stories.expect("stories pane");
+            let right = thread.thread.expect("thread pane");
+            assert!(thread.detail.is_none());
+            assert_eq!(stories.width, width * 44 / 100);
+            assert_eq!(right.x, stories.width);
+            assert_eq!(right.width, width - stories.width);
 
-        let medium = layout_for(
-            Rect::new(0, 0, 100, 30),
-            FocusPane::Stories,
-            SecondaryPane::Detail,
-        );
-        assert!(medium.stories.is_some() && medium.thread.is_none() && medium.detail.is_some());
+            let detail = layout_for(
+                Rect::new(0, 0, width, 30),
+                FocusPane::Detail,
+                SecondaryPane::Detail,
+            );
+            assert!(detail.stories.is_some() && detail.thread.is_none() && detail.detail.is_some());
+        }
+    }
 
-        let narrow = layout_for(
-            Rect::new(0, 0, 60, 30),
-            FocusPane::Thread,
-            SecondaryPane::Detail,
-        );
-        assert!(narrow.stories.is_none() && narrow.thread.is_some() && narrow.detail.is_none());
+    #[test]
+    fn narrow_layout_renders_only_the_focused_pane() {
+        let area = Rect::new(0, 0, 79, 30);
+        let stories = layout_for(area, FocusPane::Stories, SecondaryPane::Thread);
+        assert!(stories.stories.is_some() && stories.thread.is_none() && stories.detail.is_none());
+
+        let thread = layout_for(area, FocusPane::Thread, SecondaryPane::Detail);
+        assert!(thread.stories.is_none() && thread.thread.is_some() && thread.detail.is_none());
+
+        let detail = layout_for(area, FocusPane::Detail, SecondaryPane::Thread);
+        assert!(detail.stories.is_none() && detail.thread.is_none() && detail.detail.is_some());
     }
 
     #[test]
@@ -861,12 +855,49 @@ mod tests {
     }
 
     #[test]
+    fn custom_accent_role_renders_the_brand_chip() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut search_page = page();
+        search_page.query = Some("rust\nterminal".to_owned());
+        let mut app = App::new(search_page);
+        let mut theme = Theme::classic();
+        theme.accent = ratatui::style::Color::Rgb(12, 34, 56);
+        theme.accent_fg = ratatui::style::Color::Rgb(240, 241, 242);
+        theme.selected_bg = ratatui::style::Color::Rgb(90, 91, 92);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("custom brand frame renders");
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| { cell.bg == theme.accent && cell.fg == theme.accent_fg })
+        );
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("rust terminal"));
+    }
+
+    #[test]
     fn every_responsive_boundary_renders_the_expected_mode() {
-        for (width, expected_mode) in [
-            (120, "3-pane"),
-            (119, "2-pane"),
-            (80, "2-pane"),
-            (79, "1-pane"),
+        for (width, expected_mode, expects_tab_hint) in [
+            (120, "2-pane", true),
+            (119, "2-pane", true),
+            (80, "2-pane", true),
+            (79, "1-pane", false),
         ] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -888,6 +919,204 @@ mod tests {
             );
             assert!(rendered.contains("? help"));
             assert!(rendered.contains("q quit"));
+            assert!(rendered.contains("Ctrl+U/D half-page"));
+            assert!(rendered.contains("PgUp/PgDn page"));
+            assert_eq!(rendered.contains("Tab pane"), expects_tab_hint);
         }
+    }
+
+    #[test]
+    fn render_applies_brand_styles_and_exposes_shortcuts() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        app.set_focus(FocusPane::Detail);
+        let theme = Theme::classic();
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("detail frame renders");
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.fg == theme.selected_fg && cell.bg == theme.selected_bg })
+        );
+        let rendered = buffer
+            .content()
+            .iter()
+            .fold(String::new(), |mut output, cell| {
+                output.push_str(cell.symbol());
+                output
+            });
+        assert!(rendered.contains("Ctrl+U/D half-page"));
+        assert!(rendered.contains("PgUp/PgDn page"));
+        assert!(rendered.contains("Press a to read here"));
+
+        let detail = layout_for(
+            Rect::new(0, 0, 120, 24),
+            FocusPane::Detail,
+            SecondaryPane::Detail,
+        )
+        .detail
+        .expect("detail pane");
+        assert_eq!(
+            buffer.cell((detail.x, detail.y)).map(|cell| cell.fg),
+            Some(theme.highlight)
+        );
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.detail_scroll(), 0);
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("help frame renders");
+        let help_popup = centered_rect(Rect::new(0, 0, 120, 24), 74, 20);
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((help_popup.x, help_popup.y))
+                .map(|cell| cell.fg),
+            Some(theme.highlight)
+        );
+        let help =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(help.contains("Ctrl+U/D"));
+        assert!(help.contains("PgUp/PgDn"));
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("prompt frame renders");
+        let prompt_popup = centered_rect(Rect::new(0, 0, 120, 24), 72, 3);
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((prompt_popup.x, prompt_popup.y))
+                .map(|cell| cell.fg),
+            Some(theme.highlight)
+        );
+    }
+
+    #[test]
+    fn long_detail_pages_to_content_end_and_reclamps_after_resize() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let body = (0..40)
+            .map(|index| format!("body-line-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.set_article(ArticleView::new("Long article", None, body));
+        let theme = Theme::classic();
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("long detail frame renders");
+        let page_down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = app.handle_key(page_down);
+        let _ = app.handle_key(page_down);
+        assert_eq!(app.detail_scroll(), 25);
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("last detail page renders");
+        let last_page =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(last_page.contains("body-line-39"));
+
+        terminal.backend_mut().resize(120, 40);
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("resized detail frame renders");
+        assert_eq!(app.detail_scroll(), 9);
+        let resized =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(resized.contains("body-line-39"));
+    }
+
+    #[test]
+    fn detail_scroll_reflows_when_width_changes() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(page());
+        let body = format!("{}body-end", "wrapped ".repeat(800));
+        app.set_article(ArticleView::new("Wrapped article", None, body));
+        let theme = Theme::classic();
+
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("wrapped detail frame renders");
+        let page_down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        for _ in 0..20 {
+            let _ = app.handle_key(page_down);
+        }
+        let two_panel_scroll = app.detail_scroll();
+        assert!(two_panel_scroll > 0);
+
+        terminal.backend_mut().resize(79, 24);
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme))
+            .expect("reflowed detail frame renders");
+        assert!(app.detail_scroll() < two_panel_scroll);
+        let reflowed =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(reflowed.contains("body-end"));
     }
 }

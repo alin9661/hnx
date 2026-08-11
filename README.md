@@ -81,19 +81,21 @@ declared, omitted, and unresolved counts. Stdout contains only requested data.
 
 The interface adapts without discarding selection or scroll state:
 
-- 120 columns and wider: navigation, story list, and reading/thread panes.
-- 80–119 columns: story list plus active detail pane.
+- 80 columns and wider: story list plus the active thread or detail pane.
 - Below 80 columns: one focused pane.
 
-Use arrow keys or `j`/`k` to move, `Tab` to change panes, `Enter` to load a
-thread or fold a comment, `/` to search, `f` to apply a case-insensitive regex
-filter, `b` to bookmark, `a` to read an article in-terminal, `o` to open a
-link, `O` to toggle offline mode, `r` to refresh, `?` for help, and `q` to
-quit. The status line always identifies offline/stale/partial data and its
+Use arrow keys or `j`/`k` to move, `Ctrl+U`/`Ctrl+D` to move half a viewport,
+and Page Up/Page Down to move a full viewport. `Tab` or `h`/`l` moves between
+the story list and active right pane; `t` selects the thread and `d` selects
+detail. `Enter` loads a thread or folds a comment, `/` searches, `f` applies a
+case-insensitive regex filter, `b` bookmarks, `a` reads an article in-terminal,
+`o` opens a link, `O` toggles offline mode, `r` refreshes, `?` opens help, and
+`q` quits. The status line always identifies offline/stale/partial data and its
 source.
 
-The default `classic` theme uses Hacker News orange and cream. `midnight`, an
-ANSI 16-color theme, `NO_COLOR`, and custom semantic TOML themes are supported.
+The default `classic` theme uses Y Combinator orange (`#FF6600`) and Hacker
+News cream (`#F7F6F0`). `midnight`, an ANSI 16-color theme, `NO_COLOR`, and
+custom semantic TOML themes are supported.
 
 ## Development
 
@@ -106,9 +108,11 @@ cargo test --all-targets
 cargo bench
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md), and
-[docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
+Project guides: [architecture](docs/ARCHITECTURE.md),
+[dependencies](docs/DEPENDENCIES.md), [performance](docs/PERFORMANCE.md),
+[themes](docs/THEMES.md), [releasing](docs/RELEASING.md),
+[contributing](CONTRIBUTING.md), the [security policy](SECURITY.md), and the
+[changelog](CHANGELOG.md).
 
 ## Provenance and naming
 

@@ -10,7 +10,7 @@ Every runtime dependency has a narrow role:
 | `futures` | Event streams and bounded asynchronous composition. |
 | `html2text` | Non-JavaScript article conversion. |
 | `open` | Browser handoff through the operating system. |
-| `ratatui` | Stateful, diff-based terminal rendering. |
+| `ratatui` | Stateful, diff-based terminal rendering and rendered-line measurement for content-aware scroll bounds. |
 | `regex` | Linear-time story filtering. |
 | `reqwest` | Pooled HTTPS with Rustls, guarded DNS, decompression, and streaming limits. |
 | `rusqlite` | Bundled SQLite cache and local state. |
